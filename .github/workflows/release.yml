@@ -62,7 +62,15 @@ jobs:
       - name: Publish to npm (provenance via OIDC trusted publishing)
         run: |
           echo "npm $(npm --version) / node $(node --version)"
-          npm publish --provenance --access public
+          VERSION=$(node -p "require('./package.json').version")
+          # Idempotent: a tag push and a manual re-run can both fire for the same
+          # version; skip (don't fail) if it's already on npm so the release still
+          # completes and the GitHub Release step below still runs.
+          if npm view "libraw-wasm@${VERSION}" version >/dev/null 2>&1; then
+            echo "libraw-wasm@${VERSION} is already published — skipping npm publish."
+          else
+            npm publish --provenance --access public
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
