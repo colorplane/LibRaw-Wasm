@@ -41,6 +41,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 		await raw.open(bytes(), { useCameraWb: true });
 		const meta = await raw.metadata(true);
 		const img = await raw.imageData();
+		const rerendered = await raw.render({ useCameraWb: true, bright: 1.5 });
 		const rawImg = await raw.rawImageData();
 		const thumb = await raw.thumbnailData();
 
@@ -98,6 +99,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 			tsIso: meta?.timestamp instanceof Date ? meta.timestamp.toISOString() : null,
 			lens: meta?.lens?.Lens,
 			imgW: img?.width, imgH: img?.height, imgLen: img?.data?.length, imgCtor: img?.data?.constructor?.name,
+			rerenderW: rerendered?.width, rerenderH: rerendered?.height, rerenderLen: rerendered?.data?.length,
 			rawLen: rawImg?.data?.length, rawCtor: rawImg?.data?.constructor?.name,
 			thumbW: thumb?.width, thumbH: thumb?.height, thumbFmt: thumb?.format,
 			concMeta: cMeta?.camera_model, concImgW: cImg?.width,
@@ -161,6 +163,7 @@ if (r && r.ok) {
 	check(r.tsYear && r.tsYear >= 2020, `timestamp scaled to a real year (got ${r.tsIso})`);
 	check(r.imgW === 6240 && r.imgH === 4168, `imageData full dims 6240x4168 (got ${r.imgW}x${r.imgH})`);
 	check(r.imgCtor === 'Uint8Array', `imageData is Uint8Array (got ${r.imgCtor})`);
+	check(r.rerenderW === 6240 && r.rerenderH === 4168 && r.rerenderLen === r.imgLen, 'render() reuses the opened RAW at full resolution');
 	check(r.rawLen === 6272 * 4168, `rawImageData full mosaic length (got ${r.rawLen})`);
 	check(r.rawCtor === 'Uint16Array', `rawImageData is Uint16Array (got ${r.rawCtor})`);
 	check(r.thumbW === 6192 && r.thumbH === 4128, `thumbnail dims 6192x4128 (got ${r.thumbW}x${r.thumbH})`);

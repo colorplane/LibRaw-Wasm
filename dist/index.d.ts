@@ -751,6 +751,9 @@ export default class LibRaw {
    */
   imageData(): Promise<LibRawImageData | undefined>;
 
+  /** Reprocess the opened RAW image without reopening or unpacking it. */
+  render(settings?: LibRawSettings): Promise<LibRawImageData | undefined>;
+
   /**
    * Fetch the raw, undebayered sensor data (16-bit mosaic, no demosaicing).
    */

@@ -34,6 +34,7 @@ public:
         // Release previous values, if any
         processor_->recycle();
         isUnpacked = false;
+		isProcessed = false;
 
 		applySettings(settings);
 
@@ -1095,54 +1096,17 @@ public:
 		if (!processor_) {
 			return val::undefined();
 		}
+		ensureUnpacked();
+		if (!isProcessed) processImage();
+		return makeProcessedImage();
+	}
 
-		// If not yet unpacked/processed, do it now
-		if (!isUnpacked) {
-			isUnpacked = true;
-
-			int ret = processor_->unpack();
-			if (ret != LIBRAW_SUCCESS) {
-				throw std::runtime_error("LibRaw: unpack() failed with code " + std::to_string(ret));
-			}
-
-			ret = processor_->dcraw_process();
-			if (ret != LIBRAW_SUCCESS) {
-				throw std::runtime_error("LibRaw: dcraw_process() failed with code " + std::to_string(ret));
-			}
-		}
-
-		// Make a processed image in memory. Pass an errcode pointer so that a
-		// failed or unavailable decoder surfaces an explicit error instead of
-		// silently resolving with nothing — e.g. a compression format this build
-		// cannot decode (see issue #27).
-		int memErr = 0;
-		libraw_processed_image_t* out = processor_->dcraw_make_mem_image(&memErr);
-		if (!out) {
-			std::string msg = "LibRaw: dcraw_make_mem_image() produced no image";
-			if (memErr != 0) {
-				msg += std::string(" (code ") + std::to_string(memErr) + ": " +
-				       libraw_strerror(memErr) + ")";
-			} else {
-				msg += " — the decoder for this file's compression format may be "
-				       "unavailable in this build";
-			}
-			throw std::runtime_error(msg);
-		}
-
-		// Prepare a JS object to hold all the result fields
-		val resultObj = val::object();
-
-		// Store the basic image info
-		resultObj.set("height", out->height);
-		resultObj.set("width",  out->width);
-		resultObj.set("colors", out->colors);
-		resultObj.set("bits",   out->bits);
-        resultObj.set("dataSize", (unsigned int)out->data_size);
-        resultObj.set("data", toJSTypedArray(out->bits, out->data_size, out->data));
-
-		processor_->dcraw_clear_mem(out);
-
-		return resultObj;
+	val render(val settings) {
+		if (!processor_) return val::undefined();
+		ensureUnpacked();
+		applySettings(settings);
+		processImage();
+		return makeProcessedImage();
 	}
 
     val thumbnailData() {
@@ -1187,14 +1151,8 @@ public:
 			return val::undefined();
 		}
 
-		// Unpack (but not dcraw_process) so we keep the raw mosaic
-		if (!isUnpacked) {
-			isUnpacked = true;
-			int ret = processor_->unpack();
-			if (ret != LIBRAW_SUCCESS) {
-				throw std::runtime_error("LibRaw: unpack() failed with code " + std::to_string(ret));
-			}
-		}
+		// Unpack (but not dcraw_process) so we keep the raw mosaic.
+		ensureUnpacked();
 
 		auto &raw = processor_->imgdata.rawdata;
 		auto &sizes = processor_->imgdata.sizes;
@@ -1222,6 +1180,48 @@ private:
 	LibRaw* processor_ = nullptr;
     std::vector<uint8_t> buffer;
 	bool isUnpacked = false;
+	bool isProcessed = false;
+
+	void ensureUnpacked() {
+		if (isUnpacked) return;
+		int ret = processor_->unpack();
+		if (ret != LIBRAW_SUCCESS) {
+			throw std::runtime_error("LibRaw: unpack() failed with code " + std::to_string(ret));
+		}
+		isUnpacked = true;
+	}
+
+	void processImage() {
+		int ret = processor_->dcraw_process();
+		if (ret != LIBRAW_SUCCESS) {
+			throw std::runtime_error("LibRaw: dcraw_process() failed with code " + std::to_string(ret));
+		}
+		isProcessed = true;
+	}
+
+	val makeProcessedImage() {
+		int memErr = 0;
+		libraw_processed_image_t* out = processor_->dcraw_make_mem_image(&memErr);
+		if (!out) {
+			std::string msg = "LibRaw: dcraw_make_mem_image() produced no image";
+			if (memErr != 0) {
+				msg += std::string(" (code ") + std::to_string(memErr) + ": " + libraw_strerror(memErr) + ")";
+			} else {
+				msg += " — the decoder for this file's compression format may be unavailable in this build";
+			}
+			throw std::runtime_error(msg);
+		}
+
+		val resultObj = val::object();
+		resultObj.set("height", out->height);
+		resultObj.set("width", out->width);
+		resultObj.set("colors", out->colors);
+		resultObj.set("bits", out->bits);
+		resultObj.set("dataSize", (unsigned int)out->data_size);
+		resultObj.set("data", toJSTypedArray(out->bits, out->data_size, out->data));
+		processor_->dcraw_clear_mem(out);
+		return resultObj;
+	}
 
 	void applySettings(const val& settings) {
 		// If 'settings' is null or undefined, just skip
@@ -1474,6 +1474,7 @@ EMSCRIPTEN_BINDINGS(libraw_module) {
 		.function("open", &WASMLibRaw::open)
 		.function("metadata", &WASMLibRaw::metadata)
         .function("imageData", &WASMLibRaw::imageData)
+		.function("render", &WASMLibRaw::render)
         .function("rawImageData", &WASMLibRaw::rawImageData)
 		.function("thumbnailData", &WASMLibRaw::thumbnailData);
 }

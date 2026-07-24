@@ -94,6 +94,14 @@ export default class LibRaw {
 	}
 
 	/**
+	 * Reprocess the opened RAW image with new output settings. The source is
+	 * unpacked only once and remains in the worker between renders.
+	 */
+	async render(settings) {
+		return await this.runFn('render', settings);
+	}
+
+	/**
 	 * Retrieve the raw, undebayered sensor data (16-bit mosaic, no demosaicing).
 	 */
 	async rawImageData() {
