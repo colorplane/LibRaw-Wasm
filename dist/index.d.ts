@@ -737,6 +737,54 @@ export type LibRawThumbnailData = ThumbnailImageData;
  */
 export type LibRawOptions = LibRawSettings;
 
+export interface IncrementalInputProgress {
+  bytesRead: number;
+  /** Omitted when the producer does not know its final byte length yet. */
+  totalBytes?: number;
+  elapsedMs: number;
+  bytesPerSecond: number;
+}
+
+export type IncrementalInputEvent =
+  | {
+      type: 'libraw-start';
+      timestamp: number;
+      /** Raw worker-clock timestamp, provided for diagnostics only. */
+      workerTimestamp?: number;
+      downloadedBytes: number;
+    }
+  | {
+      type: 'download-complete';
+      timestamp: number;
+      downloadedBytes: number;
+    };
+
+export interface IncrementalInputOptions {
+  /** Exact producer length when known. Enables random-access parsing before EOF. */
+  expectedSize?: number;
+  /**
+   * Hard allocation and download limit. Unknown-length inputs reserve at most
+   * this many bytes and fail rather than growing without bound.
+   * @default 536870912
+   */
+  maxBytes?: number;
+  signal?: AbortSignal;
+  onProgress?: (progress: IncrementalInputProgress) => void;
+  onEvent?: (event: IncrementalInputEvent) => void;
+}
+
+export interface IncrementalOpenResult {
+  bytesRead: number;
+  totalBytes: number;
+  timings: {
+    startedAt: number;
+    libRawStartedAt: number;
+    downloadCompletedAt: number;
+    /** Time during which LibRaw was active while the producer was still open. */
+    overlapMs: number;
+  };
+}
+
 /**
  * LibRaw-Wasm decoder.
  *
@@ -747,10 +795,26 @@ export default class LibRaw {
   /** Create a decoder instance. */
   constructor();
 
+  /** Whether the current runtime can expose shared incremental input memory. */
+  static supportsIncrementalInput(): boolean;
+
   /**
    * Open and decode a RAW buffer.
    */
   open(bytes: BufferSource, settings?: LibRawSettings): Promise<void>;
+
+  /**
+   * Incrementally open RAW bytes from a stream or async iterable.
+   *
+   * Chunks are copied directly into a bounded shared WASM allocation. LibRaw
+   * consumes it through a synchronous random-access datastream, allowing
+   * identify/parsing work to overlap production when `expectedSize` is known.
+   */
+  openStream(
+    source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | BufferSource>,
+    settings?: LibRawSettings,
+    options?: IncrementalInputOptions
+  ): Promise<IncrementalOpenResult>;
 
   /**
    * Fetch metadata extracted from the opened RAW file.
