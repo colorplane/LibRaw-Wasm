@@ -69,7 +69,7 @@ await test('sequential metadata() then imageData() resolves correctly', async ()
 // 3. Many concurrent calls each get their own reply.
 await test('N concurrent calls each resolve with their own reply', async () => {
 	const raw = new LibRaw();
-	const fns = ['metadata', 'imageData', 'render', 'rawImageData', 'thumbnailData'];
+	const fns = ['metadata', 'imageData', 'render', 'rawImageData', 'rawImagePreview', 'thumbnailData'];
 	const results = await withTimeout(
 		Promise.all(fns.map(fn => raw.runFn(fn))), 2000, 'N concurrent');
 	results.forEach((r, i) => assert(r?.payload === `${fns[i]}-result`,

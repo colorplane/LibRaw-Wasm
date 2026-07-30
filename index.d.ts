@@ -690,6 +690,24 @@ export interface RawSensorData {
 }
 
 /**
+ * Compact sensor overview returned by `rawImagePreview()`.
+ *
+ * `data` contains four Uint16 values per preview pixel in R, G, B, mono order.
+ * The dimensions and margins describe the full sensor frame.
+ */
+export interface RawSensorPreviewData {
+  raw_width: number;
+  raw_height: number;
+  top_margin: number;
+  left_margin: number;
+  width: number;
+  height: number;
+  preview_width: number;
+  preview_height: number;
+  data: Uint16Array;
+}
+
+/**
  * Thumbnail image data returned by `thumbnailData()`.
  */
 export interface ThumbnailImageData {
@@ -758,6 +776,14 @@ export default class LibRaw {
    * Fetch the raw, undebayered sensor data (16-bit mosaic, no demosaicing).
    */
   rawImageData(): Promise<RawSensorData | undefined>;
+
+  /**
+   * Fetch a compact averaged overview without transferring the full mosaic.
+   *
+   * The unpacked sensor stays resident in the worker, making a later
+   * `rawImageData()` call suitable for on-demand exact-pixel viewing.
+   */
+  rawImagePreview(maxDimension?: number): Promise<RawSensorPreviewData | undefined>;
 
   /**
    * Fetch the embedded thumbnail preview, when available.

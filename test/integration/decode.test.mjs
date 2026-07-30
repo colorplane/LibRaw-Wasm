@@ -42,6 +42,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 		const meta = await raw.metadata(true);
 		const img = await raw.imageData();
 		const rerendered = await raw.render({ useCameraWb: true, bright: 1.5 });
+		const rawPreview = await raw.rawImagePreview(1024);
 		const rawImg = await raw.rawImageData();
 		const thumb = await raw.thumbnailData();
 
@@ -101,6 +102,8 @@ const withTimeout = (p, ms, label) => Promise.race([
 			imgW: img?.width, imgH: img?.height, imgLen: img?.data?.length, imgCtor: img?.data?.constructor?.name,
 			rerenderW: rerendered?.width, rerenderH: rerendered?.height, rerenderLen: rerendered?.data?.length,
 			rawLen: rawImg?.data?.length, rawCtor: rawImg?.data?.constructor?.name,
+			previewW: rawPreview?.preview_width, previewH: rawPreview?.preview_height,
+			previewLen: rawPreview?.data?.length, previewCtor: rawPreview?.data?.constructor?.name,
 			thumbW: thumb?.width, thumbH: thumb?.height, thumbFmt: thumb?.format,
 			concMeta: cMeta?.camera_model, concImgW: cImg?.width,
 			reHalfW: cImg?.width, reFullW: reImg?.width,
@@ -166,6 +169,9 @@ if (r && r.ok) {
 	check(r.rerenderW === 6240 && r.rerenderH === 4168 && r.rerenderLen === r.imgLen, 'render() reuses the opened RAW at full resolution');
 	check(r.rawLen === 6272 * 4168, `rawImageData full mosaic length (got ${r.rawLen})`);
 	check(r.rawCtor === 'Uint16Array', `rawImageData is Uint16Array (got ${r.rawCtor})`);
+	check(r.previewW === 1024 && r.previewH === 681, `rawImagePreview fits 1024px (got ${r.previewW}x${r.previewH})`);
+	check(r.previewLen === r.previewW * r.previewH * 4, `rawImagePreview has RGBA16 samples (got ${r.previewLen})`);
+	check(r.previewCtor === 'Uint16Array', `rawImagePreview is Uint16Array (got ${r.previewCtor})`);
 	check(r.thumbW === 6192 && r.thumbH === 4128, `thumbnail dims 6192x4128 (got ${r.thumbW}x${r.thumbH})`);
 	check(r.thumbFmt === 'jpeg', `thumbnail format jpeg (got ${r.thumbFmt})`);
 	check(r.concMeta === 'ILME-FX30' && r.concImgW === 3120, 'concurrent Promise.all resolved with correct payloads');

@@ -109,6 +109,14 @@ export default class LibRaw {
 	}
 
 	/**
+	 * Retrieve a compact 16-bit RGB/mono overview of the raw sensor plane.
+	 * The full unpacked mosaic stays in the worker for a later rawImageData().
+	 */
+	async rawImagePreview(maxDimension = 1024) {
+		return await this.runFn('rawImagePreview', Math.max(1, Math.round(maxDimension)));
+	}
+
+	/**
      * Retrieve the embedded JPEG preview (Fast extraction)
      */
     async thumbnailData() {

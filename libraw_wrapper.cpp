@@ -1176,6 +1176,149 @@ public:
 		return resultObj;
 	}
 
+	// Returns a compact, display-oriented overview of the raw sensor plane.
+	//
+	// Each output pixel contains four Uint16 values: averaged red, green, blue,
+	// and monochrome samples. The full mosaic remains owned by this worker, so a
+	// later rawImageData() call only needs to copy the already-unpacked plane.
+	val rawImagePreview(unsigned maxDimension) {
+		if (!processor_) {
+			return val::undefined();
+		}
+
+		ensureUnpacked();
+
+		auto &raw = processor_->imgdata.rawdata;
+		auto &sizes = processor_->imgdata.sizes;
+		if (!raw.raw_image || !sizes.raw_width || !sizes.raw_height) {
+			return val::undefined();
+		}
+
+		const unsigned safeMaxDimension = std::max(1u, maxDimension);
+		const double scale = std::min(
+			1.0,
+			static_cast<double>(safeMaxDimension) /
+				static_cast<double>(std::max(sizes.raw_width, sizes.raw_height))
+		);
+		const unsigned previewWidth = std::max(
+			1u,
+			static_cast<unsigned>(std::ceil(static_cast<double>(sizes.raw_width) * scale))
+		);
+		const unsigned previewHeight = std::max(
+			1u,
+			static_cast<unsigned>(std::ceil(static_cast<double>(sizes.raw_height) * scale))
+		);
+		std::vector<uint16_t> preview(
+			static_cast<size_t>(previewWidth) * static_cast<size_t>(previewHeight) * 4u,
+			0
+		);
+		std::vector<unsigned> sourceLefts(previewWidth);
+		std::vector<unsigned> sourceRights(previewWidth);
+		std::vector<unsigned> sourceTops(previewHeight);
+		std::vector<unsigned> sourceBottoms(previewHeight);
+		for (unsigned previewX = 0; previewX < previewWidth; ++previewX) {
+			sourceLefts[previewX] = static_cast<unsigned>(
+				static_cast<uint64_t>(previewX) * sizes.raw_width / previewWidth
+			);
+			sourceRights[previewX] = std::max(
+				sourceLefts[previewX] + 1,
+				static_cast<unsigned>(
+					static_cast<uint64_t>(previewX + 1) * sizes.raw_width / previewWidth
+				)
+			);
+		}
+		for (unsigned previewY = 0; previewY < previewHeight; ++previewY) {
+			sourceTops[previewY] = static_cast<unsigned>(
+				static_cast<uint64_t>(previewY) * sizes.raw_height / previewHeight
+			);
+			sourceBottoms[previewY] = std::max(
+				sourceTops[previewY] + 1,
+				static_cast<unsigned>(
+					static_cast<uint64_t>(previewY + 1) * sizes.raw_height / previewHeight
+				)
+			);
+		}
+
+		for (unsigned previewY = 0; previewY < previewHeight; ++previewY) {
+			const unsigned sourceTop = sourceTops[previewY];
+			const unsigned sourceBottom = sourceBottoms[previewY];
+			for (unsigned previewX = 0; previewX < previewWidth; ++previewX) {
+				const unsigned sourceLeft = sourceLefts[previewX];
+				const unsigned sourceRight = sourceRights[previewX];
+				uint64_t channelSums[3] = {0, 0, 0};
+				uint32_t channelCounts[3] = {0, 0, 0};
+				uint64_t monoSum = 0;
+				uint32_t monoCount = 0;
+
+				// A complete 2x2 Bayer cell is enough to retain every channel.
+				// X-Trans uses a 6x6 pattern; sample at most one such cell. This
+				// keeps preview work proportional to output size instead of the
+				// full sensor while canvas filtering handles final downscaling.
+				const unsigned patternSize =
+					processor_->imgdata.idata.filters == 9 ? 6u : 2u;
+				const unsigned sampleBottom = std::min(
+					sourceBottom,
+					sourceTop + patternSize
+				);
+				const unsigned sampleRight = std::min(
+					sourceRight,
+					sourceLeft + patternSize
+				);
+				for (unsigned y = sourceTop; y < sampleBottom; ++y) {
+					const size_t rowOffset = static_cast<size_t>(y) * sizes.raw_width;
+					for (unsigned x = sourceLeft; x < sampleRight; ++x) {
+						const uint16_t sample = raw.raw_image[rowOffset + x];
+						monoSum += sample;
+						++monoCount;
+						const auto filters = processor_->imgdata.idata.filters;
+						const int color = filters && filters != 9
+							? static_cast<int>(
+								(filters >> (((((y << 1) & 14) + (x & 1)) << 1))) & 3
+							)
+							: processor_->COLOR(y, x);
+						const int channel = color == 0 ? 0 : color == 2 ? 2 :
+							(color == 1 || color == 3) ? 1 : -1;
+						if (channel >= 0) {
+							channelSums[channel] += sample;
+							++channelCounts[channel];
+						}
+					}
+				}
+
+				const uint16_t mono = monoCount
+					? static_cast<uint16_t>(monoSum / monoCount)
+					: 0;
+				const size_t outputOffset =
+					(static_cast<size_t>(previewY) * previewWidth + previewX) * 4u;
+				for (int channel = 0; channel < 3; ++channel) {
+					preview[outputOffset + channel] = channelCounts[channel]
+						? static_cast<uint16_t>(channelSums[channel] / channelCounts[channel])
+						: mono;
+				}
+				preview[outputOffset + 3] = mono;
+			}
+		}
+
+		val resultObj = val::object();
+		resultObj.set("raw_height", sizes.raw_height);
+		resultObj.set("raw_width", sizes.raw_width);
+		resultObj.set("top_margin", sizes.top_margin);
+		resultObj.set("left_margin", sizes.left_margin);
+		resultObj.set("height", sizes.height);
+		resultObj.set("width", sizes.width);
+		resultObj.set("preview_width", previewWidth);
+		resultObj.set("preview_height", previewHeight);
+		resultObj.set(
+			"data",
+			toJSTypedArray(
+				16,
+				preview.size() * sizeof(uint16_t),
+				reinterpret_cast<uint8_t*>(preview.data())
+			)
+		);
+		return resultObj;
+	}
+
 private:
 	LibRaw* processor_ = nullptr;
     std::vector<uint8_t> buffer;
@@ -1476,5 +1619,6 @@ EMSCRIPTEN_BINDINGS(libraw_module) {
         .function("imageData", &WASMLibRaw::imageData)
 		.function("render", &WASMLibRaw::render)
         .function("rawImageData", &WASMLibRaw::rawImageData)
+		.function("rawImagePreview", &WASMLibRaw::rawImagePreview)
 		.function("thumbnailData", &WASMLibRaw::thumbnailData);
 }
