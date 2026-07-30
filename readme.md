@@ -44,6 +44,55 @@ console.log('Raw sensor data:', rawImageData); // { raw_width, raw_height, width
 
 ```
 
+## Incremental input
+
+`openStream()` accepts a standard `ReadableStream<Uint8Array>` or async
+iterable. It places chunks directly into a bounded allocation in the worker's
+shared WebAssembly memory. LibRaw reads that allocation through a synchronous,
+random-access datastream, so format identification can overlap the producer
+without transferring a completed file to the worker or copying it into a
+second native vector.
+
+```javascript
+const response = await fetch(rawUrl, {signal});
+if (!response.ok) throw new Error(`RAW request failed (${response.status})`);
+
+const expectedSize = Number(response.headers.get('content-length')) || 0;
+const raw = new LibRaw();
+const input = await raw.openStream(
+	response.body,
+	{useCameraWb: true},
+	{
+		expectedSize,
+		// Unknown-length inputs cannot grow beyond this application policy.
+		maxBytes: 512 * 1024 * 1024,
+		signal,
+		onProgress({bytesRead, totalBytes, bytesPerSecond}) {
+			console.log({bytesRead, totalBytes, bytesPerSecond});
+		},
+		onEvent(event) {
+			if (event.type === 'libraw-start') {
+				console.log('LibRaw started with', event.downloadedBytes, 'bytes available');
+			}
+		}
+	}
+);
+console.log('producer/LibRaw overlap:', input.timings.overlapMs, 'ms');
+const image = await raw.imageData();
+```
+
+Pass the exact size when it is available. LibRaw's public input contract is
+synchronous and random-access; a known size lets it seek and parse while later
+ranges are still arriving. When the size is unknown, decoder construction
+starts immediately and parsing resumes at EOF once the stream publishes its
+actual size.
+
+Incremental input requires `SharedArrayBuffer` and `Atomics`, which usually
+means serving the page with cross-origin isolation headers. Check
+`LibRaw.supportsIncrementalInput()` and retain a complete-buffer fallback for
+other environments. `maxBytes` is a hard bound: the stream rejects rather than
+allocating beyond it.
+
 # Settings
 ```javascript
 {

@@ -88,6 +88,117 @@ const withTimeout = (p, ms, label) => Promise.race([
 			const nx = tx * H, ny = ty * W;
 			dngStats = { rLeft: rL / nx, rRight: rR / nx, gTop: gT / ny, gBottom: gB / ny, nonzero: nz };
 		}
+
+		// Delayed chunked input: the worker must enter the real LibRaw
+		// open_datastream() call before the final network chunk arrives, while
+		// producing byte-for-byte identical output to open(BufferSource).
+		const streamedResponse = await fetch('/delayed-known.dng');
+		const streamedEvents = [];
+		const streamedRaw = new LibRaw();
+		const streamedOpen = await streamedRaw.openStream(
+			streamedResponse.body,
+			{ useCameraWb: true, outputBps: 8 },
+			{
+				expectedSize: Number(streamedResponse.headers.get('content-length')),
+				maxBytes: 2 * 1024 * 1024,
+				onEvent: event => streamedEvents.push(event)
+			}
+		);
+		const streamedImg = await streamedRaw.imageData();
+		let streamedEquivalent = Boolean(
+			streamedImg &&
+			dngImg &&
+			streamedImg.width === dngImg.width &&
+			streamedImg.height === dngImg.height &&
+			streamedImg.data.length === dngImg.data.length
+		);
+		if (streamedEquivalent) {
+			for (let i = 0; i < dngImg.data.length; i++) {
+				if (streamedImg.data[i] !== dngImg.data[i]) {
+					streamedEquivalent = false;
+					break;
+				}
+			}
+		}
+		streamedRaw.dispose();
+
+		// Unknown-length streams are bounded by maxBytes. LibRaw construction
+		// starts immediately and parsing resumes once EOF publishes the true size.
+		const unknownResponse = await fetch('/delayed-unknown.dng');
+		const unknownRaw = new LibRaw();
+		const unknownOpen = await unknownRaw.openStream(
+			unknownResponse.body,
+			{ useCameraWb: true, outputBps: 8 },
+			{ maxBytes: 2 * 1024 * 1024 }
+		);
+		const unknownImg = await unknownRaw.imageData();
+		unknownRaw.dispose();
+
+		// Abort must wake a datastream blocked in synchronous LibRaw code and
+		// cancel the browser stream rather than waiting for the server to finish.
+		const cancelController = new AbortController();
+		const cancelResponse = await fetch('/slow-cancel.dng', {signal: cancelController.signal});
+		const cancelRaw = new LibRaw();
+		let cancelRejected = false;
+		try {
+			await cancelRaw.openStream(
+				cancelResponse.body,
+				{},
+				{
+					expectedSize: Number(cancelResponse.headers.get('content-length')),
+					signal: cancelController.signal,
+					onProgress: progress => {
+						if (progress.bytesRead > 0) cancelController.abort();
+					}
+				}
+			);
+		} catch (error) {
+			cancelRejected = error?.name === 'AbortError';
+		}
+		cancelRaw.dispose();
+
+		// Producer failures and invalid RAW bytes must both reject cleanly.
+		const networkFailureRaw = new LibRaw();
+		let networkFailureRejected = false;
+		try {
+			await networkFailureRaw.openStream((async function * () {
+				yield new Uint8Array([1, 2, 3, 4]);
+				throw new Error('synthetic network failure');
+			})(), {}, {expectedSize: 128, maxBytes: 1024});
+		} catch (error) {
+			networkFailureRejected = /network failure/.test(String(error?.message));
+		}
+		networkFailureRaw.dispose();
+
+		const decoderFailureRaw = new LibRaw();
+		let decoderFailureRejected = false;
+		try {
+			await decoderFailureRaw.openStream(
+				(async function * () { yield new Uint8Array([0x4e, 0x4f, 0x54, 0x52, 0x41, 0x57]); })(),
+				{},
+				{expectedSize: 6, maxBytes: 6}
+			);
+			decoderFailureRejected = !(await decoderFailureRaw.imageData());
+		} catch {
+			decoderFailureRejected = true;
+		}
+		decoderFailureRaw.dispose();
+
+		const boundedRaw = new LibRaw();
+		let memoryBoundRejected = false;
+		try {
+			await boundedRaw.openStream(
+				(async function * () {
+					yield new Uint8Array(768);
+					yield new Uint8Array(768);
+				})(),
+				{},
+				{maxBytes: 1024}
+			);
+		} catch (error) {
+			memoryBoundRejected = error instanceof RangeError;
+		}
+		boundedRaw.dispose();
 		dngRaw.dispose();
 
 		window.__RESULT = {
@@ -96,6 +207,20 @@ const withTimeout = (p, ms, label) => Promise.race([
 			dngW: dngImg?.width, dngH: dngImg?.height, dngColors: dngImg?.colors,
 			dngLen: dngImg?.data?.length, dngCtor: dngImg?.data?.constructor?.name,
 			dngErr, dngStats,
+			streamedEquivalent,
+			streamedBytes: streamedOpen?.bytesRead,
+			streamedOverlapMs: streamedOpen?.timings?.overlapMs,
+			streamedStartedBeforeComplete:
+				streamedOpen?.timings?.libRawStartedAt > 0 &&
+				streamedOpen.timings.libRawStartedAt < streamedOpen.timings.downloadCompletedAt,
+			streamedBytesAtStart:
+				streamedEvents.find(event => event.type === 'libraw-start')?.downloadedBytes,
+			unknownBytes: unknownOpen?.bytesRead,
+			unknownW: unknownImg?.width,
+			cancelRejected,
+			networkFailureRejected,
+			decoderFailureRejected,
+			memoryBoundRejected,
 			tsYear: meta?.timestamp instanceof Date ? meta.timestamp.getUTCFullYear() : null,
 			tsIso: meta?.timestamp instanceof Date ? meta.timestamp.toISOString() : null,
 			lens: meta?.lens?.Lens,
@@ -121,6 +246,39 @@ const server = http.createServer(async (req, res) => {
 	if (url === '/' || url === '/index.html') {
 		res.setHeader('Content-Type', 'text/html');
 		return res.end(PAGE);
+	}
+	if (
+		url === '/delayed-known.dng' ||
+		url === '/delayed-unknown.dng' ||
+		url === '/slow-cancel.dng'
+	) {
+		const data = await readFile(join(ROOT, 'test/integration/lossy.dng'));
+		res.setHeader('Content-Type', 'application/octet-stream');
+		if (url !== '/delayed-unknown.dng') {
+			res.setHeader('Content-Length', data.byteLength);
+		}
+		const chunkSize = url === '/delayed-known.dng' ? 256 : 2048;
+		const delayMs = url === '/slow-cancel.dng'
+			? 60
+			: url === '/delayed-known.dng'
+				? 30
+				: 12;
+		let offset = 0;
+		let closed = false;
+		req.on('close', () => { closed = true; });
+		const writeNext = () => {
+			if (closed) return;
+			if (offset >= data.byteLength) {
+				res.end();
+				return;
+			}
+			const end = Math.min(data.byteLength, offset + chunkSize);
+			res.write(data.subarray(offset, end));
+			offset = end;
+			setTimeout(writeNext, delayMs);
+		};
+		writeNext();
+		return;
 	}
 	try {
 		const p = normalize(join(ROOT, url));
@@ -187,6 +345,15 @@ if (r && r.ok) {
 	check(s && s.nonzero > 0, `lossy DNG decoded non-empty pixels (nonzero=${s?.nonzero})`);
 	check(s && s.rRight > s.rLeft + 20, `lossy DNG red gradient L->R (L=${s?.rLeft?.toFixed(1)} R=${s?.rRight?.toFixed(1)})`);
 	check(s && s.gBottom > s.gTop + 20, `lossy DNG green gradient T->B (T=${s?.gTop?.toFixed(1)} B=${s?.gBottom?.toFixed(1)})`);
+	check(r.streamedEquivalent, 'incremental decode is byte-for-byte equivalent to complete-buffer decode');
+	check(r.streamedStartedBeforeComplete, `LibRaw started before download completion (overlap=${r.streamedOverlapMs}ms)`);
+	check(r.streamedOverlapMs > 20, `incremental pipeline recorded meaningful overlap (${r.streamedOverlapMs}ms)`);
+	check(r.streamedBytesAtStart < r.streamedBytes, `LibRaw started with a partial input (${r.streamedBytesAtStart}/${r.streamedBytes} bytes)`);
+	check(r.unknownBytes > 0 && r.unknownW === 256, `unknown-length stream decoded (${r.unknownBytes} bytes, width=${r.unknownW})`);
+	check(r.cancelRejected, 'incremental input rejects immediately with AbortError on cancellation');
+	check(r.networkFailureRejected, 'incremental input propagates producer/network failure');
+	check(r.decoderFailureRejected, 'incremental input propagates decoder failure');
+	check(r.memoryBoundRejected, 'unknown-length input enforces maxBytes without unbounded growth');
 }
 
 const failed = checks.filter((c) => !c.ok);
