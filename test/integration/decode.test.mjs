@@ -17,8 +17,16 @@ import { extname, join, normalize, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
+import {makeRgbDng} from '../progressive-fixture.mjs';
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const FIXTURE = 'example-sony.ARW';
+const PROGRESSIVE_FIXTURE = makeRgbDng({
+	width: 96,
+	height: 64,
+	orientation: 6,
+	rowsPerStrip: 4
+}).bytes;
 const MIME = {
 	'.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
 	'.html': 'text/html', '.json': 'application/json', '.map': 'application/json',
@@ -101,6 +109,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 			{
 				expectedSize: Number(streamedResponse.headers.get('content-length')),
 				maxBytes: 2 * 1024 * 1024,
+				progressive: true,
 				onEvent: event => streamedEvents.push(event)
 			}
 		);
@@ -133,6 +142,55 @@ const withTimeout = (p, ms, label) => Promise.race([
 		);
 		const unknownImg = await unknownRaw.imageData();
 		unknownRaw.dispose();
+
+		// A baseline uncompressed LinearRaw DNG exposes deterministic completed
+		// scanlines. The first oriented region must arrive while the response is
+		// still open, without stretching it into the unavailable black area.
+		const progressiveResponse = await fetch('/delayed-progressive.dng');
+		const progressiveRaw = new LibRaw();
+		const progressiveEvents = [];
+		const progressiveRegions = [];
+		let progressiveFirstRegionAt = 0;
+		const progressiveOpen = await progressiveRaw.openStream(
+			progressiveResponse.body,
+			{useCameraWb: true, outputBps: 8},
+			{
+				expectedSize: Number(progressiveResponse.headers.get('content-length')),
+				maxBytes: 2 * 1024 * 1024,
+				progressive: true,
+				progressiveBatchRows: 2,
+				onEvent: event => progressiveEvents.push(event),
+				onRegion: region => {
+					if (!progressiveFirstRegionAt) progressiveFirstRegionAt = performance.now();
+					progressiveRegions.push({
+						x: region.x,
+						y: region.y,
+						width: region.width,
+						height: region.height,
+						bytes: region.data.byteLength,
+						decodedPixels: region.decodedPixels,
+						totalPixels: region.totalPixels
+					});
+				}
+			}
+		);
+		const progressiveInfo = progressiveEvents.find(
+			event => event.type === 'progressive-image-info'
+		);
+		const progressiveComplete = progressiveEvents.find(
+			event => event.type === 'progressive-image-complete'
+		);
+		const progressiveDownloadComplete = progressiveEvents.find(
+			event => event.type === 'download-complete'
+		);
+		let progressiveDecoded = null;
+		let progressiveDecodeError = null;
+		try {
+			progressiveDecoded = await progressiveRaw.imageData();
+		} catch (error) {
+			progressiveDecodeError = String(error?.message || error);
+		}
+		progressiveRaw.dispose();
 
 		// Abort must wake a datastream blocked in synchronous LibRaw code and
 		// cancel the browser stream rather than waiting for the server to finish.
@@ -215,8 +273,19 @@ const withTimeout = (p, ms, label) => Promise.race([
 				streamedOpen.timings.libRawStartedAt < streamedOpen.timings.downloadCompletedAt,
 			streamedBytesAtStart:
 				streamedEvents.find(event => event.type === 'libraw-start')?.downloadedBytes,
+			streamedProgressiveFallback:
+				streamedEvents.find(event => event.type === 'progressive-image-fallback')?.reason,
 			unknownBytes: unknownOpen?.bytesRead,
 			unknownW: unknownImg?.width,
+			progressiveBytes: progressiveOpen?.bytesRead,
+			progressiveInfo,
+			progressiveRegions,
+			progressiveComplete: Boolean(progressiveComplete),
+			progressiveBeforeDownloadComplete:
+				progressiveFirstRegionAt > 0 &&
+				progressiveFirstRegionAt < progressiveDownloadComplete?.timestamp,
+			progressiveDecodedWidth: progressiveDecoded?.width,
+			progressiveDecodeError,
 			cancelRejected,
 			networkFailureRejected,
 			decoderFailureRejected,
@@ -250,18 +319,27 @@ const server = http.createServer(async (req, res) => {
 	if (
 		url === '/delayed-known.dng' ||
 		url === '/delayed-unknown.dng' ||
-		url === '/slow-cancel.dng'
+		url === '/slow-cancel.dng' ||
+		url === '/delayed-progressive.dng'
 	) {
-		const data = await readFile(join(ROOT, 'test/integration/lossy.dng'));
+		const data = url === '/delayed-progressive.dng'
+			? PROGRESSIVE_FIXTURE
+			: await readFile(join(ROOT, 'test/integration/lossy.dng'));
 		res.setHeader('Content-Type', 'application/octet-stream');
 		if (url !== '/delayed-unknown.dng') {
 			res.setHeader('Content-Length', data.byteLength);
 		}
-		const chunkSize = url === '/delayed-known.dng' ? 256 : 2048;
+		const chunkSize = url === '/delayed-known.dng'
+			? 256
+			: url === '/delayed-progressive.dng'
+				? 192
+				: 2048;
 		const delayMs = url === '/slow-cancel.dng'
 			? 60
 			: url === '/delayed-known.dng'
 				? 30
+				: url === '/delayed-progressive.dng'
+					? 18
 				: 12;
 		let offset = 0;
 		let closed = false;
@@ -349,7 +427,40 @@ if (r && r.ok) {
 	check(r.streamedStartedBeforeComplete, `LibRaw started before download completion (overlap=${r.streamedOverlapMs}ms)`);
 	check(r.streamedOverlapMs > 20, `incremental pipeline recorded meaningful overlap (${r.streamedOverlapMs}ms)`);
 	check(r.streamedBytesAtStart < r.streamedBytes, `LibRaw started with a partial input (${r.streamedBytesAtStart}/${r.streamedBytes} bytes)`);
+	check(
+		r.streamedProgressiveFallback === 'compressed-pixel-data',
+		`compressed DNG keeps the complete-render fallback (${r.streamedProgressiveFallback})`
+	);
 	check(r.unknownBytes > 0 && r.unknownW === 256, `unknown-length stream decoded (${r.unknownBytes} bytes, width=${r.unknownW})`);
+	check(
+		r.progressiveInfo?.width === 64 &&
+			r.progressiveInfo?.height === 96 &&
+			r.progressiveInfo?.orientation === 6,
+		`progressive metadata preserves orientation (${r.progressiveInfo?.width}x${r.progressiveInfo?.height}, orientation=${r.progressiveInfo?.orientation})`
+	);
+	check(
+		r.progressiveRegions?.length > 1 &&
+			r.progressiveRegions.every(region =>
+				region.width >= 1 &&
+				region.width <= 2 &&
+				region.height === 96
+			) &&
+			new Set(r.progressiveRegions.flatMap(region =>
+				Array.from({length: region.width}, (_, offset) => region.x + offset)
+			)).size === 64,
+		`rotated scanline batches land in final positions (${r.progressiveRegions?.length} regions)`
+	);
+	check(r.progressiveBeforeDownloadComplete, 'first progressive region arrived before download completion');
+	check(r.progressiveComplete, 'progressive input replaced every black source region exactly once');
+	check(
+		r.progressiveRegions?.at(-1)?.decodedPixels ===
+			r.progressiveRegions?.at(-1)?.totalPixels,
+		'progressive region coverage is complete and monotonic'
+	);
+	check(
+		r.progressiveDecodedWidth > 0 && r.progressiveDecodeError == null,
+		`progressive LinearRaw DNG remains decodable by LibRaw (width=${r.progressiveDecodedWidth}, error=${r.progressiveDecodeError})`
+	);
 	check(r.cancelRejected, 'incremental input rejects immediately with AbortError on cancellation');
 	check(r.networkFailureRejected, 'incremental input propagates producer/network failure');
 	check(r.decoderFailureRejected, 'incremental input propagates decoder failure');
