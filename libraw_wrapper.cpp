@@ -3,14 +3,231 @@
 #include <stdexcept>
 #include <iostream>
 #include <cstring>
+#include <memory>
+#include <limits>
 
 // Emscripten Embind
 #include <emscripten/bind.h>
+#include <emscripten/threading.h>
 
 // LibRaw includes
 #include "libraw/libraw.h"
 
+#if defined(USE_JPEG)
+#include <jpeglib.h>
+#endif
+
 using namespace emscripten;
+
+namespace {
+constexpr size_t INPUT_AVAILABLE = 0;
+constexpr size_t INPUT_STATE = 1;
+constexpr size_t INPUT_EPOCH = 2;
+constexpr size_t INPUT_FINAL_SIZE = 3;
+constexpr size_t INPUT_CONTROL_WORDS = 4;
+
+enum IncrementalInputState : uint32_t {
+	INPUT_STREAMING = 0,
+	INPUT_COMPLETE = 1,
+	INPUT_ABORTED = 2,
+	INPUT_FAILED = 3
+};
+
+class IncrementalDatastream final : public LibRaw_abstract_datastream {
+public:
+	IncrementalDatastream(
+		unsigned char* bytes,
+		size_t capacity,
+		size_t expectedSize,
+		uint32_t* control
+	) : bytes_(bytes),
+		capacity_(capacity),
+		expectedSize_(expectedSize),
+		control_(control) {}
+
+	int valid() override {
+		return bytes_ && control_ && capacity_ > 0;
+	}
+
+	int read(void* target, size_t itemSize, size_t itemCount) override {
+		if (!itemSize || !itemCount) return 0;
+		if (itemCount > std::numeric_limits<size_t>::max() / itemSize) {
+			throw std::runtime_error("LibRaw incremental input read overflow");
+		}
+		const size_t requested = itemSize * itemCount;
+		const size_t logicalSize = currentLogicalSize();
+		if (position_ >= logicalSize) return 0;
+		const size_t wanted = std::min(requested, logicalSize - position_);
+		const size_t available = waitFor(position_ + wanted);
+		if (position_ >= available) return 0;
+		const size_t copied = std::min(wanted, available - position_);
+		std::memmove(target, bytes_ + position_, copied);
+		position_ += copied;
+		return static_cast<int>((copied + itemSize - 1) / itemSize);
+	}
+
+	int seek(INT64 offset, int whence) override {
+		const size_t logicalSize = currentLogicalSize();
+		INT64 next = 0;
+		switch (whence) {
+		case SEEK_SET:
+			next = offset;
+			break;
+		case SEEK_CUR:
+			next = static_cast<INT64>(position_) + offset;
+			break;
+		case SEEK_END:
+			next = static_cast<INT64>(logicalSize) + offset;
+			break;
+		default:
+			return -1;
+		}
+		if (next < 0) next = 0;
+		if (static_cast<uint64_t>(next) > logicalSize) {
+			next = static_cast<INT64>(logicalSize);
+		}
+		position_ = static_cast<size_t>(next);
+		return 0;
+	}
+
+	INT64 tell() override {
+		return static_cast<INT64>(position_);
+	}
+
+	INT64 size() override {
+		return static_cast<INT64>(currentLogicalSize());
+	}
+
+	int get_char() override {
+		unsigned char value = 0;
+		return read(&value, 1, 1) == 1 ? value : -1;
+	}
+
+	char* gets(char* output, int outputSize) override {
+		if (!output || outputSize < 1) return nullptr;
+		int written = 0;
+		while (written < outputSize - 1) {
+			const int value = get_char();
+			if (value < 0) break;
+			output[written++] = static_cast<char>(value);
+			if (value == '\n') break;
+		}
+		output[written] = '\0';
+		return written ? output : nullptr;
+	}
+
+	int scanf_one(const char* format, void* output) override {
+		if (!format || !output) return 0;
+		const size_t originalPosition = position_;
+		char scanBuffer[25] = {};
+		const int items = read(scanBuffer, 1, 24);
+		position_ = originalPosition;
+		if (items < 1) return 0;
+		const int result = std::sscanf(scanBuffer, format, output);
+		if (result > 0) {
+			int consumed = 0;
+			while (position_ < currentLogicalSize() && consumed <= 24) {
+				const int value = get_char();
+				++consumed;
+				if (value <= 0 || value == ' ' || value == '\t' || value == '\n') break;
+			}
+		}
+		return result;
+	}
+
+	int eof() override {
+		const uint32_t state = atomicLoad(INPUT_STATE);
+		if (state == INPUT_ABORTED) throw std::runtime_error("LibRaw incremental input aborted");
+		if (state == INPUT_FAILED) throw std::runtime_error("LibRaw incremental input failed");
+		return state == INPUT_COMPLETE && position_ >= finalSize();
+	}
+
+	int jpeg_src(void* jpegData) override {
+#if defined(USE_JPEG)
+		const size_t total = waitForCompletion();
+		if (position_ > total) return -1;
+		jpeg_mem_src(
+			static_cast<j_decompress_ptr>(jpegData),
+			bytes_ + position_,
+			static_cast<unsigned long>(total - position_)
+		);
+		return 0;
+#else
+		(void)jpegData;
+		return -1;
+#endif
+	}
+
+private:
+	unsigned char* bytes_ = nullptr;
+	size_t capacity_ = 0;
+	size_t expectedSize_ = 0;
+	uint32_t* control_ = nullptr;
+	size_t position_ = 0;
+
+	uint32_t atomicLoad(size_t index) const {
+		return __atomic_load_n(control_ + index, __ATOMIC_ACQUIRE);
+	}
+
+	size_t availableSize() const {
+		return std::min(capacity_, static_cast<size_t>(atomicLoad(INPUT_AVAILABLE)));
+	}
+
+	size_t finalSize() const {
+		return std::min(capacity_, static_cast<size_t>(atomicLoad(INPUT_FINAL_SIZE)));
+	}
+
+	void checkState(uint32_t state) const {
+		if (state == INPUT_ABORTED) {
+			throw std::runtime_error("LibRaw incremental input aborted");
+		}
+		if (state == INPUT_FAILED) {
+			throw std::runtime_error("LibRaw incremental input failed");
+		}
+	}
+
+	void waitForChange(uint32_t epoch) const {
+		emscripten_futex_wait(control_ + INPUT_EPOCH, epoch, INFINITY);
+	}
+
+	size_t waitFor(size_t requiredExclusive) const {
+		const size_t boundedRequired = std::min(requiredExclusive, capacity_);
+		for (;;) {
+			const uint32_t state = atomicLoad(INPUT_STATE);
+			checkState(state);
+			const size_t available = availableSize();
+			if (available >= boundedRequired || state == INPUT_COMPLETE) return available;
+			const uint32_t epoch = atomicLoad(INPUT_EPOCH);
+			if (availableSize() >= boundedRequired || atomicLoad(INPUT_STATE) != INPUT_STREAMING) {
+				continue;
+			}
+			waitForChange(epoch);
+		}
+	}
+
+	size_t waitForCompletion() const {
+		for (;;) {
+			const uint32_t state = atomicLoad(INPUT_STATE);
+			checkState(state);
+			if (state == INPUT_COMPLETE) return finalSize();
+			const uint32_t epoch = atomicLoad(INPUT_EPOCH);
+			if (atomicLoad(INPUT_STATE) != INPUT_STREAMING) continue;
+			waitForChange(epoch);
+		}
+	}
+
+	size_t currentLogicalSize() const {
+		const uint32_t state = atomicLoad(INPUT_STATE);
+		checkState(state);
+		if (state == INPUT_COMPLETE) return finalSize();
+		if (expectedSize_) return std::min(expectedSize_, capacity_);
+		// A random-access decoder cannot know the meaning of SEEK_END until EOF.
+		// Unknown-length streams still begin decoder construction immediately,
+		// then block here until the producer publishes the actual final size.
+		return waitForCompletion();
+	}
+};
+}
 
 class WASMLibRaw {
 public:
@@ -22,6 +239,8 @@ public:
 		if (processor_) {
 			cleanupParamsStrings();
             processor_->recycle();
+			incrementalStream_.reset();
+			incrementalBuffer_.reset();
 			delete processor_;
 			processor_ = nullptr;
 		}
@@ -31,6 +250,7 @@ public:
 		if (!processor_) {
 			throw std::runtime_error("LibRaw not initialized");
 		}
+		resetIncrementalInput();
         // Release previous values, if any
         processor_->recycle();
         isUnpacked = false;
@@ -42,6 +262,75 @@ public:
 		int ret = processor_->open_buffer((void*)buffer.data(), buffer.size());
 		if (ret != LIBRAW_SUCCESS) {
 			throw std::runtime_error("LibRaw: open_buffer() failed with code " + std::to_string(ret));
+		}
+	}
+
+	val beginIncrementalInput(unsigned capacity, unsigned expectedSize, val settings) {
+		if (!processor_) {
+			throw std::runtime_error("LibRaw not initialized");
+		}
+		if (!capacity || expectedSize > capacity) {
+			throw std::runtime_error("Invalid LibRaw incremental input capacity");
+		}
+		resetIncrementalInput();
+		processor_->recycle();
+		std::vector<uint8_t>().swap(buffer);
+		isUnpacked = false;
+		isProcessed = false;
+		applySettings(settings);
+
+		incrementalBuffer_.reset(new unsigned char[capacity]);
+		incrementalCapacity_ = capacity;
+		incrementalExpectedSize_ = expectedSize;
+		for (size_t index = 0; index < INPUT_CONTROL_WORDS; ++index) {
+			__atomic_store_n(incrementalControl_ + index, 0u, __ATOMIC_RELEASE);
+		}
+		incrementalStream_.reset(new IncrementalDatastream(
+			incrementalBuffer_.get(),
+			incrementalCapacity_,
+			incrementalExpectedSize_,
+			incrementalControl_
+		));
+
+		val result = val::object();
+		result.set("bufferOffset", static_cast<unsigned>(
+			reinterpret_cast<uintptr_t>(incrementalBuffer_.get())
+		));
+		result.set("controlOffset", static_cast<unsigned>(
+			reinterpret_cast<uintptr_t>(incrementalControl_)
+		));
+		result.set("capacity", capacity);
+		result.set("expectedSize", expectedSize);
+		// Embind does not guarantee that Module.HEAPU8 is exported. Return a
+		// temporary view so worker.js can publish the underlying shared WASM
+		// memory without copying or transferring it.
+		result.set(
+			"sharedView",
+			val(typed_memory_view(capacity, incrementalBuffer_.get()))
+		);
+		return result;
+	}
+
+	void openIncrementalInput() {
+		if (!processor_ || !incrementalStream_) {
+			throw std::runtime_error("LibRaw incremental input was not initialized");
+		}
+		const int ret = processor_->open_datastream(incrementalStream_.get());
+		if (ret != LIBRAW_SUCCESS) {
+			throw std::runtime_error(
+				"LibRaw: open_datastream() failed with code " + std::to_string(ret)
+			);
+		}
+	}
+
+	void resetIncrementalInput() {
+		if (processor_) processor_->recycle();
+		incrementalStream_.reset();
+		incrementalBuffer_.reset();
+		incrementalCapacity_ = 0;
+		incrementalExpectedSize_ = 0;
+		for (size_t index = 0; index < INPUT_CONTROL_WORDS; ++index) {
+			__atomic_store_n(incrementalControl_ + index, 0u, __ATOMIC_RELEASE);
 		}
 	}
 
@@ -1322,6 +1611,11 @@ public:
 private:
 	LibRaw* processor_ = nullptr;
     std::vector<uint8_t> buffer;
+	std::unique_ptr<unsigned char[]> incrementalBuffer_;
+	std::unique_ptr<IncrementalDatastream> incrementalStream_;
+	alignas(4) uint32_t incrementalControl_[INPUT_CONTROL_WORDS] = {};
+	size_t incrementalCapacity_ = 0;
+	size_t incrementalExpectedSize_ = 0;
 	bool isUnpacked = false;
 	bool isProcessed = false;
 
@@ -1615,6 +1909,9 @@ EMSCRIPTEN_BINDINGS(libraw_module) {
 	class_<WASMLibRaw>("LibRaw")
 		.constructor<>()
 		.function("open", &WASMLibRaw::open)
+		.function("beginIncrementalInput", &WASMLibRaw::beginIncrementalInput)
+		.function("openIncrementalInput", &WASMLibRaw::openIncrementalInput)
+		.function("resetIncrementalInput", &WASMLibRaw::resetIncrementalInput)
 		.function("metadata", &WASMLibRaw::metadata)
         .function("imageData", &WASMLibRaw::imageData)
 		.function("render", &WASMLibRaw::render)

@@ -3,10 +3,11 @@ import LibRawModule from './libraw.js';
 let ready;
 let LibRawClass;
 let raw;
+let module;
 
 async function initLibRaw() {
 	ready = (async () => {
-		const module = await LibRawModule();
+		module = await LibRawModule();
 		LibRawClass = module.LibRaw;
 		raw = new LibRawClass();
 	})();
@@ -22,7 +23,18 @@ self.onmessage = async (event) => {
 	const {id, fn, args} = event.data;
 	try {
 		await ready;
+		if (fn === 'openIncrementalInput') {
+			self.postMessage({
+				id,
+				event: 'incremental-open-start',
+				timestamp: performance.now()
+			});
+		}
 		const out = raw[fn](...args);
+		if (fn === 'beginIncrementalInput') {
+			out.heapBuffer = out.sharedView.buffer;
+			delete out.sharedView;
+		}
 		const transferList = [];
 		for (const key in out) {
 			const value = out[key];

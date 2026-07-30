@@ -93,6 +93,8 @@ echo -e "\n==> Building libraw.js + libraw.wasm..."
 emcc \
   --bind \
   -I./includes \
+  -DUSE_JPEG \
+  -DUSE_JPEG8 \
   -s USE_LIBPNG=1 \
   -s USE_LIBJPEG=1 \
   -s USE_ZLIB=1 \
