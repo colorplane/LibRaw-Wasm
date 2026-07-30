@@ -745,6 +745,19 @@ export interface IncrementalInputProgress {
   bytesPerSecond: number;
 }
 
+export interface ProgressiveImageRegion {
+  /** Final, orientation-corrected destination rectangle. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Tightly packed RGBA8 pixels for the destination rectangle. */
+  data: Uint8Array;
+  /** Number of source pixels decoded across all regions emitted so far. */
+  decodedPixels: number;
+  totalPixels: number;
+}
+
 export type IncrementalInputEvent =
   | {
       type: 'libraw-start';
@@ -757,6 +770,42 @@ export type IncrementalInputEvent =
       type: 'download-complete';
       timestamp: number;
       downloadedBytes: number;
+    }
+  | {
+      type: 'progressive-image-info';
+      timestamp: number;
+      format: 'rgb-tiff' | 'linear-raw-tiff';
+      /** Final orientation-corrected dimensions. */
+      width: number;
+      height: number;
+      sourceWidth: number;
+      sourceHeight: number;
+      /** TIFF/EXIF orientation in the inclusive range 1–8. */
+      orientation: number;
+      totalPixels: number;
+    }
+  | {
+      type: 'progressive-image-fallback';
+      timestamp: number;
+      reason: string;
+      width?: number;
+      height?: number;
+      sourceWidth?: number;
+      sourceHeight?: number;
+      orientation?: number;
+    }
+  | {
+      type: 'progressive-image-complete';
+      timestamp: number;
+      decodedPixels: number;
+      totalPixels: number;
+    }
+  | {
+      type: 'progressive-image-interrupted' | 'progressive-image-cancelled';
+      timestamp: number;
+      decodedPixels: number;
+      totalPixels: number;
+      reason: string;
     };
 
 export interface IncrementalInputOptions {
@@ -771,6 +820,16 @@ export interface IncrementalInputOptions {
   signal?: AbortSignal;
   onProgress?: (progress: IncrementalInputProgress) => void;
   onEvent?: (event: IncrementalInputEvent) => void;
+  /**
+   * Decode completed scanline regions while uncompressed chunky RGB/LinearRaw
+   * TIFF-DNG bytes arrive. Unsupported or compressed layouts emit a fallback
+   * event and continue through the ordinary LibRaw path.
+   * @default false
+   */
+  progressive?: boolean;
+  /** Maximum completed source rows emitted in one region callback. @default 32 */
+  progressiveBatchRows?: number;
+  onRegion?: (region: ProgressiveImageRegion) => void;
 }
 
 export interface IncrementalOpenResult {

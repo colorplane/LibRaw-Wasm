@@ -93,6 +93,40 @@ means serving the page with cross-origin isolation headers. Check
 other environments. `maxBytes` is a hard bound: the stream rejects rather than
 allocating beyond it.
 
+### Progressive regions
+
+Applications can opt into stable region callbacks while `openStream()` is
+still receiving bytes:
+
+```javascript
+await raw.openStream(response.body, settings, {
+	expectedSize: Number(response.headers.get('content-length')) || 0,
+	progressive: true,
+	progressiveBatchRows: 32,
+	onEvent(event) {
+		if (event.type === 'progressive-image-info') {
+			createBlackSurface(event.width, event.height);
+		}
+		if (event.type === 'progressive-image-fallback') {
+			console.log('Use the normal full render:', event.reason);
+		}
+	},
+	onRegion({x, y, width, height, data}) {
+		uploadRgbaRegion(x, y, width, height, data);
+	}
+});
+```
+
+The progressive decoder intentionally supports only baseline uncompressed,
+chunky RGB or LinearRaw TIFF/DNG strips with uniform 8- or 16-bit samples.
+Those layouts expose deterministic completed scanlines, so every emitted RGBA
+region is orientation-correct, final-positioned, and emitted once. Compressed,
+planar, tiled, CFA, or otherwise unsafe layouts emit
+`progressive-image-fallback` and continue through the ordinary LibRaw path.
+Region memory is bounded by `progressiveBatchRows`; the decoder reads directly
+from the existing shared incremental allocation and never creates another
+complete-file buffer.
+
 # Settings
 ```javascript
 {
