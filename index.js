@@ -1,5 +1,3 @@
-import {ProgressiveTiffDecoder} from './progressive-tiff.js';
-
 export default class LibRaw {
 	constructor() {
 		this.worker = new Worker(new URL('./worker.js', import.meta.url), {type:"module"});
@@ -102,13 +100,7 @@ export default class LibRaw {
 		maxBytes = 512 * 1024 * 1024,
 		signal,
 		onProgress,
-		onEvent,
-		onRegion,
-		progressive = false,
-		progressiveBatchRows = 32,
-		progressiveDecodePreview,
-		progressiveMaxPreviewBytes = 64 * 1024 * 1024,
-		progressiveMaxPreviewPixels = 64 * 1024 * 1024
+		onEvent
 	} = {}) {
 		if(!LibRaw.supportsIncrementalInput()) {
 			throw new Error('LibRaw incremental input requires SharedArrayBuffer and Atomics');
@@ -151,16 +143,6 @@ export default class LibRaw {
 			prepared.controlOffset,
 			4
 		);
-		const progressiveDecoder = progressive
-			? new ProgressiveTiffDecoder(bytes, {
-				batchRows: progressiveBatchRows,
-				decodePreview: progressiveDecodePreview,
-				maxPreviewBytes: progressiveMaxPreviewBytes,
-				maxPreviewPixels: progressiveMaxPreviewPixels,
-				onEvent,
-				onRegion
-			})
-			: null;
 		this.incrementalControl = control;
 		this.incrementalReader = reader || iterator;
 
@@ -224,7 +206,6 @@ export default class LibRaw {
 					Atomics.store(control, 0, downloaded);
 					Atomics.add(control, 2, 1);
 					Atomics.notify(control, 2);
-					progressiveDecoder?.push(downloaded);
 					const timestamp = performance.now();
 					onProgress?.({
 						bytesRead: downloaded,
@@ -235,7 +216,6 @@ export default class LibRaw {
 				}
 				downloadCompletedAt = performance.now();
 				wake(1);
-				progressiveDecoder?.finish(downloaded);
 				onEvent?.({
 					type: 'download-complete',
 					timestamp: downloadCompletedAt,
@@ -243,7 +223,6 @@ export default class LibRaw {
 				});
 			} catch(error) {
 				producerError = error;
-				progressiveDecoder?.fail(error, error?.name === 'AbortError');
 				wake(error?.name === 'AbortError' ? 2 : 3);
 				throw error;
 			}

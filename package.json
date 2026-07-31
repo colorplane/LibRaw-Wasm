@@ -13,7 +13,7 @@
 		"build": "node build.js",
 		"benchmark:streaming": "node test/integration/streaming-benchmark.mjs",
 		"compile": "bash compileLibraw.sh",
-		"test": "node test/worker-reply-routing.test.mjs && node test/progressive-tiff.test.mjs",
+		"test": "node test/worker-reply-routing.test.mjs",
 		"test:integration": "node test/integration/decode.test.mjs"
 	},
 	"files": [

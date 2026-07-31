@@ -17,16 +17,8 @@ import { extname, join, normalize, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
-import {makeRgbDng} from '../progressive-fixture.mjs';
-
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const FIXTURE = 'example-sony.ARW';
-const PROGRESSIVE_FIXTURE = makeRgbDng({
-	width: 96,
-	height: 64,
-	orientation: 6,
-	rowsPerStrip: 4
-}).bytes;
 const MIME = {
 	'.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
 	'.html': 'text/html', '.json': 'application/json', '.map': 'application/json',
@@ -109,7 +101,6 @@ const withTimeout = (p, ms, label) => Promise.race([
 			{
 				expectedSize: Number(streamedResponse.headers.get('content-length')),
 				maxBytes: 2 * 1024 * 1024,
-				progressive: true,
 				onEvent: event => streamedEvents.push(event)
 			}
 		);
@@ -142,104 +133,6 @@ const withTimeout = (p, ms, label) => Promise.race([
 		);
 		const unknownImg = await unknownRaw.imageData();
 		unknownRaw.dispose();
-
-		// A baseline uncompressed LinearRaw DNG exposes deterministic completed
-		// scanlines. The first oriented region must arrive while the response is
-		// still open, without stretching it into the unavailable black area.
-		const progressiveResponse = await fetch('/delayed-progressive.dng');
-		const progressiveRaw = new LibRaw();
-		const progressiveEvents = [];
-		const progressiveRegions = [];
-		let progressiveFirstRegionAt = 0;
-		const progressiveOpen = await progressiveRaw.openStream(
-			progressiveResponse.body,
-			{useCameraWb: true, outputBps: 8},
-			{
-				expectedSize: Number(progressiveResponse.headers.get('content-length')),
-				maxBytes: 2 * 1024 * 1024,
-				progressive: true,
-				progressiveBatchRows: 2,
-				onEvent: event => progressiveEvents.push(event),
-				onRegion: region => {
-					if (!progressiveFirstRegionAt) progressiveFirstRegionAt = performance.now();
-					progressiveRegions.push({
-						x: region.x,
-						y: region.y,
-						width: region.width,
-						height: region.height,
-						bytes: region.data.byteLength,
-						decodedPixels: region.decodedPixels,
-						totalPixels: region.totalPixels
-					});
-				}
-			}
-		);
-		const progressiveInfo = progressiveEvents.find(
-			event => event.type === 'progressive-image-info'
-		);
-		const progressiveComplete = progressiveEvents.find(
-			event => event.type === 'progressive-image-complete'
-		);
-		const progressiveDownloadComplete = progressiveEvents.find(
-			event => event.type === 'download-complete'
-		);
-		let progressiveDecoded = null;
-		let progressiveDecodeError = null;
-		try {
-			progressiveDecoded = await progressiveRaw.imageData();
-		} catch (error) {
-			progressiveDecodeError = String(error?.message || error);
-		}
-		progressiveRaw.dispose();
-
-		// Sony ARW stores a full-resolution JPEG before its much larger sensor
-		// payload. Discover its final geometry from the IFD chain, decode only
-		// that bounded range, and emit an ImageBitmap while the ARW response is
-		// still streaming.
-		const arwResponse = await fetch('/delayed-arw');
-		const arwRaw = new LibRaw();
-		const arwEvents = [];
-		let arwDownloadedBytes = 0;
-		let resolveArwRegion;
-		const arwRegionPromise = new Promise(resolve => {
-			resolveArwRegion = resolve;
-		});
-		const arwOpen = await arwRaw.openStream(
-			arwResponse.body,
-			{useCameraWb: true, outputBps: 8},
-			{
-				expectedSize: Number(arwResponse.headers.get('content-length')),
-				maxBytes: 64 * 1024 * 1024,
-				progressive: true,
-				onProgress: progress => {
-					arwDownloadedBytes = progress.bytesRead;
-				},
-				onEvent: event => arwEvents.push(event),
-				onRegion: region => {
-					const result = {
-						x: region.x,
-						y: region.y,
-						width: region.width,
-						height: region.height,
-						source: region.source,
-						hasBitmap: region.bitmap instanceof ImageBitmap,
-						downloadedBytes: arwDownloadedBytes,
-						timestamp: performance.now()
-					};
-					region.bitmap?.close();
-					resolveArwRegion(result);
-				}
-			}
-		);
-		const arwRegion = await withTimeout(arwRegionPromise, 10000, 'ARW progressive preview');
-		const arwInfo = arwEvents.find(
-			event => event.type === 'progressive-image-info'
-		);
-		const arwDownloadComplete = arwEvents.find(
-			event => event.type === 'download-complete'
-		);
-		const arwMeta = await arwRaw.metadata();
-		arwRaw.dispose();
 
 		// Abort must wake a datastream blocked in synchronous LibRaw code and
 		// cancel the browser stream rather than waiting for the server to finish.
@@ -322,26 +215,8 @@ const withTimeout = (p, ms, label) => Promise.race([
 				streamedOpen.timings.libRawStartedAt < streamedOpen.timings.downloadCompletedAt,
 			streamedBytesAtStart:
 				streamedEvents.find(event => event.type === 'libraw-start')?.downloadedBytes,
-			streamedProgressiveFallback:
-				streamedEvents.find(event => event.type === 'progressive-image-fallback')?.reason,
 			unknownBytes: unknownOpen?.bytesRead,
 			unknownW: unknownImg?.width,
-			progressiveBytes: progressiveOpen?.bytesRead,
-			progressiveInfo,
-			progressiveRegions,
-			progressiveComplete: Boolean(progressiveComplete),
-			progressiveBeforeDownloadComplete:
-				progressiveFirstRegionAt > 0 &&
-				progressiveFirstRegionAt < progressiveDownloadComplete?.timestamp,
-			progressiveDecodedWidth: progressiveDecoded?.width,
-			progressiveDecodeError,
-			arwBytes: arwOpen?.bytesRead,
-			arwInfo,
-			arwRegion,
-			arwPreviewBeforeDownloadComplete:
-				arwRegion?.timestamp > 0 &&
-				arwRegion.timestamp < arwDownloadComplete?.timestamp,
-			arwModel: arwMeta?.camera_model,
 			cancelRejected,
 			networkFailureRejected,
 			decoderFailureRejected,
@@ -375,35 +250,19 @@ const server = http.createServer(async (req, res) => {
 	if (
 		url === '/delayed-known.dng' ||
 		url === '/delayed-unknown.dng' ||
-		url === '/slow-cancel.dng' ||
-		url === '/delayed-progressive.dng' ||
-		url === '/delayed-arw'
+		url === '/slow-cancel.dng'
 	) {
-		const data = url === '/delayed-progressive.dng'
-			? PROGRESSIVE_FIXTURE
-			: url === '/delayed-arw'
-				? await readFile(join(ROOT, FIXTURE))
-				: await readFile(join(ROOT, 'test/integration/lossy.dng'));
+		const data = await readFile(join(ROOT, 'test/integration/lossy.dng'));
 		res.setHeader('Content-Type', 'application/octet-stream');
 		if (url !== '/delayed-unknown.dng') {
 			res.setHeader('Content-Length', data.byteLength);
 		}
-		const chunkSize = url === '/delayed-known.dng'
-			? 256
-			: url === '/delayed-progressive.dng'
-				? 192
-				: url === '/delayed-arw'
-					? 256 * 1024
-				: 2048;
+		const chunkSize = url === '/delayed-known.dng' ? 256 : 2048;
 		const delayMs = url === '/slow-cancel.dng'
 			? 60
 			: url === '/delayed-known.dng'
 				? 30
-				: url === '/delayed-progressive.dng'
-					? 18
-					: url === '/delayed-arw'
-						? 15
-					: 12;
+				: 12;
 		let offset = 0;
 		let closed = false;
 		req.on('close', () => { closed = true; });
@@ -490,60 +349,7 @@ if (r && r.ok) {
 	check(r.streamedStartedBeforeComplete, `LibRaw started before download completion (overlap=${r.streamedOverlapMs}ms)`);
 	check(r.streamedOverlapMs > 20, `incremental pipeline recorded meaningful overlap (${r.streamedOverlapMs}ms)`);
 	check(r.streamedBytesAtStart < r.streamedBytes, `LibRaw started with a partial input (${r.streamedBytesAtStart}/${r.streamedBytes} bytes)`);
-	check(
-		r.streamedProgressiveFallback === 'compressed-pixel-data',
-		`compressed DNG keeps the complete-render fallback (${r.streamedProgressiveFallback})`
-	);
 	check(r.unknownBytes > 0 && r.unknownW === 256, `unknown-length stream decoded (${r.unknownBytes} bytes, width=${r.unknownW})`);
-	check(
-		r.progressiveInfo?.width === 64 &&
-			r.progressiveInfo?.height === 96 &&
-			r.progressiveInfo?.orientation === 6,
-		`progressive metadata preserves orientation (${r.progressiveInfo?.width}x${r.progressiveInfo?.height}, orientation=${r.progressiveInfo?.orientation})`
-	);
-	check(
-		r.progressiveRegions?.length > 1 &&
-			r.progressiveRegions.every(region =>
-				region.width >= 1 &&
-				region.width <= 2 &&
-				region.height === 96
-			) &&
-			new Set(r.progressiveRegions.flatMap(region =>
-				Array.from({length: region.width}, (_, offset) => region.x + offset)
-			)).size === 64,
-		`rotated scanline batches land in final positions (${r.progressiveRegions?.length} regions)`
-	);
-	check(r.progressiveBeforeDownloadComplete, 'first progressive region arrived before download completion');
-	check(r.progressiveComplete, 'progressive input replaced every black source region exactly once');
-	check(
-		r.progressiveRegions?.at(-1)?.decodedPixels ===
-			r.progressiveRegions?.at(-1)?.totalPixels,
-		'progressive region coverage is complete and monotonic'
-	);
-	check(
-		r.progressiveDecodedWidth > 0 && r.progressiveDecodeError == null,
-		`progressive LinearRaw DNG remains decodable by LibRaw (width=${r.progressiveDecodedWidth}, error=${r.progressiveDecodeError})`
-	);
-	check(
-		r.arwInfo?.format === 'embedded-jpeg' &&
-			r.arwInfo?.width === 6192 &&
-			r.arwInfo?.height === 4128 &&
-			r.arwInfo?.orientation === 1,
-		`ARW publishes early final preview geometry (${r.arwInfo?.width}x${r.arwInfo?.height}, ${r.arwInfo?.format})`
-	);
-	check(
-		r.arwRegion?.hasBitmap &&
-			r.arwRegion?.source === 'embedded-jpeg' &&
-			r.arwRegion?.width === 6192 &&
-			r.arwRegion?.height === 4128,
-		`ARW emits its embedded preview ImageBitmap (${r.arwRegion?.width}x${r.arwRegion?.height})`
-	);
-	check(
-		r.arwPreviewBeforeDownloadComplete &&
-			r.arwRegion?.downloadedBytes < r.arwBytes,
-		`ARW preview arrives before download completion (${r.arwRegion?.downloadedBytes}/${r.arwBytes} bytes)`
-	);
-	check(r.arwModel === 'ILME-FX30', `streamed ARW remains open in LibRaw (${r.arwModel})`);
 	check(r.cancelRejected, 'incremental input rejects immediately with AbortError on cancellation');
 	check(r.networkFailureRejected, 'incremental input propagates producer/network failure');
 	check(r.decoderFailureRejected, 'incremental input propagates decoder failure');
