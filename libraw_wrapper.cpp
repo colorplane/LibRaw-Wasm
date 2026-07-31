@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <limits>
 
@@ -1398,6 +1399,14 @@ public:
 		return makeProcessedImage();
 	}
 
+	val renderPreview(val settings, unsigned maxDimension) {
+		if (!processor_) return val::undefined();
+		ensureUnpacked();
+		applySettings(settings);
+		processImage();
+		return makeProcessedPreview(std::max(1u, maxDimension));
+	}
+
     val thumbnailData() {
 		if (!processor_) return val::undefined();
 
@@ -1660,6 +1669,86 @@ private:
 		return resultObj;
 	}
 
+	val makeProcessedPreview(unsigned maxDimension) {
+		int memErr = 0;
+		libraw_processed_image_t* out = processor_->dcraw_make_mem_image(&memErr);
+		if (!out) {
+			std::string msg = "LibRaw: dcraw_make_mem_image() produced no image";
+			if (memErr != 0) {
+				msg += std::string(" (code ") + std::to_string(memErr) + ": " + libraw_strerror(memErr) + ")";
+			}
+			throw std::runtime_error(msg);
+		}
+
+		if (out->width <= 0 || out->height <= 0 || out->colors <= 0) {
+			processor_->dcraw_clear_mem(out);
+			throw std::runtime_error("LibRaw: processed image has invalid dimensions");
+		}
+		const unsigned outputWidth = static_cast<unsigned>(out->width);
+		const unsigned outputHeight = static_cast<unsigned>(out->height);
+		const unsigned outputColors = static_cast<unsigned>(out->colors);
+		const unsigned largestDimension = std::max(outputWidth, outputHeight);
+		const double scale = largestDimension > maxDimension
+			? static_cast<double>(maxDimension) / static_cast<double>(largestDimension)
+			: 1.0;
+		const unsigned previewWidth = std::max(
+			1u,
+			static_cast<unsigned>(std::round(static_cast<double>(outputWidth) * scale))
+		);
+		const unsigned previewHeight = std::max(
+			1u,
+			static_cast<unsigned>(std::round(static_cast<double>(outputHeight) * scale))
+		);
+		const unsigned bytesPerSample = out->bits == 16 ? 2u : 1u;
+		const size_t bytesPerPixel = static_cast<size_t>(outputColors) * bytesPerSample;
+		std::vector<uint8_t> preview(
+			static_cast<size_t>(previewWidth) * previewHeight * bytesPerPixel
+		);
+
+		for (unsigned y = 0; y < previewHeight; ++y) {
+			const unsigned sourceY = std::min(
+				outputHeight - 1,
+				static_cast<unsigned>(
+					(static_cast<uint64_t>(2u * y + 1u) * outputHeight) /
+					(2u * previewHeight)
+				)
+			);
+			for (unsigned x = 0; x < previewWidth; ++x) {
+				const unsigned sourceX = std::min(
+					outputWidth - 1,
+					static_cast<unsigned>(
+						(static_cast<uint64_t>(2u * x + 1u) * outputWidth) /
+						(2u * previewWidth)
+					)
+				);
+				const size_t sourceOffset =
+					(static_cast<size_t>(sourceY) * outputWidth + sourceX) *
+					bytesPerPixel;
+				const size_t destinationOffset =
+					(static_cast<size_t>(y) * previewWidth + x) *
+					bytesPerPixel;
+				std::memcpy(
+					preview.data() + destinationOffset,
+					out->data + sourceOffset,
+					bytesPerPixel
+				);
+			}
+		}
+
+		val resultObj = val::object();
+		resultObj.set("height", previewHeight);
+		resultObj.set("width", previewWidth);
+		resultObj.set("colors", out->colors);
+		resultObj.set("bits", out->bits);
+		resultObj.set("dataSize", static_cast<unsigned>(preview.size()));
+		resultObj.set(
+			"data",
+			toJSTypedArray(out->bits, preview.size(), preview.data())
+		);
+		processor_->dcraw_clear_mem(out);
+		return resultObj;
+	}
+
 	void applySettings(const val& settings) {
 		// If 'settings' is null or undefined, just skip
 		if (settings.isNull() || settings.isUndefined()) {
@@ -1915,6 +2004,7 @@ EMSCRIPTEN_BINDINGS(libraw_module) {
 		.function("metadata", &WASMLibRaw::metadata)
         .function("imageData", &WASMLibRaw::imageData)
 		.function("render", &WASMLibRaw::render)
+		.function("renderPreview", &WASMLibRaw::renderPreview)
         .function("rawImageData", &WASMLibRaw::rawImageData)
 		.function("rawImagePreview", &WASMLibRaw::rawImagePreview)
 		.function("thumbnailData", &WASMLibRaw::thumbnailData);

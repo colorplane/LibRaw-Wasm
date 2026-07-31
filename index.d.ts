@@ -837,6 +837,17 @@ export default class LibRaw {
   render(settings?: LibRawSettings): Promise<LibRawImageData | undefined>;
 
   /**
+   * Reprocess the complete opened RAW image and return a bounded pixel preview.
+   *
+   * LibRaw applies the same settings as {@link render}; downsampling happens
+   * inside the worker before pixels cross the worker boundary.
+   */
+  renderPreview(
+    settings?: LibRawSettings,
+    maxDimension?: number
+  ): Promise<LibRawImageData | undefined>;
+
+  /**
    * Fetch the raw, undebayered sensor data (16-bit mosaic, no demosaicing).
    */
   rawImageData(): Promise<RawSensorData | undefined>;

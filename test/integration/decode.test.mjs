@@ -42,6 +42,10 @@ const withTimeout = (p, ms, label) => Promise.race([
 		const meta = await raw.metadata(true);
 		const img = await raw.imageData();
 		const rerendered = await raw.render({ useCameraWb: true, bright: 1.5 });
+		const renderedPreview = await raw.renderPreview(
+			{ useCameraWb: true, halfSize: true, outputBps: 8 },
+			1024,
+		);
 		const rawPreview = await raw.rawImagePreview(1024);
 		const rawImg = await raw.rawImageData();
 		const thumb = await raw.thumbnailData();
@@ -226,6 +230,10 @@ const withTimeout = (p, ms, label) => Promise.race([
 			lens: meta?.lens?.Lens,
 			imgW: img?.width, imgH: img?.height, imgLen: img?.data?.length, imgCtor: img?.data?.constructor?.name,
 			rerenderW: rerendered?.width, rerenderH: rerendered?.height, rerenderLen: rerendered?.data?.length,
+			renderedPreviewW: renderedPreview?.width, renderedPreviewH: renderedPreview?.height,
+			renderedPreviewColors: renderedPreview?.colors,
+			renderedPreviewLen: renderedPreview?.data?.length,
+			renderedPreviewCtor: renderedPreview?.data?.constructor?.name,
 			rawLen: rawImg?.data?.length, rawCtor: rawImg?.data?.constructor?.name,
 			previewW: rawPreview?.preview_width, previewH: rawPreview?.preview_height,
 			previewLen: rawPreview?.data?.length, previewCtor: rawPreview?.data?.constructor?.name,
@@ -325,6 +333,12 @@ if (r && r.ok) {
 	check(r.imgW === 6240 && r.imgH === 4168, `imageData full dims 6240x4168 (got ${r.imgW}x${r.imgH})`);
 	check(r.imgCtor === 'Uint8Array', `imageData is Uint8Array (got ${r.imgCtor})`);
 	check(r.rerenderW === 6240 && r.rerenderH === 4168 && r.rerenderLen === r.imgLen, 'render() reuses the opened RAW at full resolution');
+	check(r.renderedPreviewW === 1024 && r.renderedPreviewH > 0 && r.renderedPreviewH < 1024,
+		`renderPreview() bounds the processed image (got ${r.renderedPreviewW}x${r.renderedPreviewH})`);
+	check(r.renderedPreviewLen === r.renderedPreviewW * r.renderedPreviewH * r.renderedPreviewColors,
+		`renderPreview() returns complete interleaved pixels (got ${r.renderedPreviewLen})`);
+	check(r.renderedPreviewCtor === 'Uint8Array',
+		`renderPreview() honors outputBps (got ${r.renderedPreviewCtor})`);
 	check(r.rawLen === 6272 * 4168, `rawImageData full mosaic length (got ${r.rawLen})`);
 	check(r.rawCtor === 'Uint16Array', `rawImageData is Uint16Array (got ${r.rawCtor})`);
 	check(r.previewW === 1024 && r.previewH === 681, `rawImagePreview fits 1024px (got ${r.previewW}x${r.previewH})`);

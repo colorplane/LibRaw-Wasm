@@ -312,6 +312,19 @@ export default class LibRaw {
 	}
 
 	/**
+	 * Reprocess the opened RAW image and transfer a bounded pixel preview.
+	 * LibRaw still applies the requested settings to the complete image; the
+	 * worker downsamples the processed result before returning it.
+	 */
+	async renderPreview(settings, maxDimension = 1024) {
+		return await this.runFn(
+			'renderPreview',
+			settings,
+			Math.max(1, Math.round(maxDimension)),
+		);
+	}
+
+	/**
 	 * Retrieve the raw, undebayered sensor data (16-bit mosaic, no demosaicing).
 	 */
 	async rawImageData() {
