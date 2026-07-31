@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 
 import {ProgressiveTiffDecoder} from '../progressive-tiff.js';
-import {makeRgbDng} from './progressive-fixture.mjs';
+import {
+	makeEmbeddedJpegRaw,
+	makeRgbDng
+} from './progressive-fixture.mjs';
 
 async function test(name, fn) {
 	try {
@@ -81,6 +84,68 @@ await test('falls back without emitting regions for compressed TIFF data', () =>
 	assert.equal(regions.length, 0);
 	assert.equal(events.at(-1).type, 'progressive-image-fallback');
 	assert.equal(events.at(-1).reason, 'compressed-pixel-data');
+});
+
+await test('emits an oriented embedded preview before the RAW payload completes', async () => {
+	const fixture = makeEmbeddedJpegRaw({
+		width: 8,
+		height: 6,
+		orientation: 6,
+		jpegLength: 128,
+		trailingBytes: 4096
+	});
+	const events = [];
+	const regions = [];
+	const decodedRanges = [];
+	const bitmap = {width: 6, height: 8, close() {}};
+	const decoder = new ProgressiveTiffDecoder(fixture.bytes, {
+		decodePreview: async (bytes, orientation) => {
+			decodedRanges.push({bytes: bytes.byteLength, orientation});
+			return {bitmap, width: bitmap.width, height: bitmap.height};
+		},
+		onEvent: event => events.push(event),
+		onRegion: region => regions.push(region)
+	});
+	decoder.push(fixture.metadataBytes);
+	const info = events.find(event => event.type === 'progressive-image-info');
+	assert.deepEqual(
+		{
+			format: info.format,
+			width: info.width,
+			height: info.height,
+			orientation: info.orientation
+		},
+		{format: 'embedded-jpeg', width: 6, height: 8, orientation: 6}
+	);
+	assert.equal(regions.length, 0);
+	decoder.push(fixture.jpegOffset + fixture.jpegLength - 1);
+	assert.equal(regions.length, 0);
+	decoder.push(fixture.jpegOffset + fixture.jpegLength);
+	await new Promise(resolve => setTimeout(resolve, 0));
+	assert.deepEqual(decodedRanges, [{bytes: 128, orientation: 6}]);
+	assert.equal(regions.length, 1);
+	assert.equal(regions[0].bitmap, bitmap);
+	assert.equal(regions[0].decodedPixels, 48);
+	assert.ok(fixture.jpegOffset + fixture.jpegLength < fixture.bytes.byteLength);
+	assert.equal(events.at(-1).type, 'progressive-image-complete');
+});
+
+await test('falls back when an embedded preview exceeds byte or pixel bounds', () => {
+	const fixture = makeEmbeddedJpegRaw({jpegLength: 1024});
+	const byteEvents = [];
+	const byteBounded = new ProgressiveTiffDecoder(fixture.bytes, {
+		maxPreviewBytes: 512,
+		onEvent: event => byteEvents.push(event)
+	});
+	byteBounded.finish(fixture.bytes.byteLength);
+	assert.equal(byteEvents.at(-1).type, 'progressive-image-fallback');
+	const pixelEvents = [];
+	const pixelBounded = new ProgressiveTiffDecoder(fixture.bytes, {
+		maxPreviewPixels: 40,
+		onEvent: event => pixelEvents.push(event)
+	});
+	pixelBounded.finish(fixture.bytes.byteLength);
+	assert.equal(pixelEvents.at(-1).type, 'progressive-image-fallback');
 });
 
 await test('keeps emitted regions when an incremental producer fails', () => {
