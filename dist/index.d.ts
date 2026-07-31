@@ -751,8 +751,14 @@ export interface ProgressiveImageRegion {
   y: number;
   width: number;
   height: number;
-  /** Tightly packed RGBA8 pixels for the destination rectangle. */
-  data: Uint8Array;
+  /** Tightly packed RGBA8 pixels for a stable TIFF scanline region. */
+  data?: Uint8Array;
+  /**
+   * Orientation-corrected embedded preview. Ownership transfers to the
+   * callback; close it after upload when the target API does not consume it.
+   */
+  bitmap?: ImageBitmap;
+  source?: 'embedded-jpeg';
   /** Number of source pixels decoded across all regions emitted so far. */
   decodedPixels: number;
   totalPixels: number;
@@ -774,7 +780,7 @@ export type IncrementalInputEvent =
   | {
       type: 'progressive-image-info';
       timestamp: number;
-      format: 'rgb-tiff' | 'linear-raw-tiff';
+      format: 'rgb-tiff' | 'linear-raw-tiff' | 'embedded-jpeg';
       /** Final orientation-corrected dimensions. */
       width: number;
       height: number;
@@ -829,6 +835,24 @@ export interface IncrementalInputOptions {
   progressive?: boolean;
   /** Maximum completed source rows emitted in one region callback. @default 32 */
   progressiveBatchRows?: number;
+  /**
+   * Maximum embedded JPEG range copied for early preview decoding.
+   * The implementation caps this value at 64 MiB. @default 67108864
+   */
+  progressiveMaxPreviewBytes?: number;
+  /**
+   * Maximum decoded embedded-preview area. The implementation caps this value
+   * at 64 megapixels. @default 67108864
+   */
+  progressiveMaxPreviewPixels?: number;
+  /**
+   * Optional environment-specific embedded JPEG decoder. Browsers default to
+   * createImageBitmap(), including TIFF/EXIF orientation.
+   */
+  progressiveDecodePreview?: (
+    bytes: Uint8Array,
+    orientation: number
+  ) => Promise<{bitmap: ImageBitmap; width: number; height: number}>;
   onRegion?: (region: ProgressiveImageRegion) => void;
 }
 
