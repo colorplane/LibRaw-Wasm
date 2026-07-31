@@ -105,7 +105,10 @@ export default class LibRaw {
 		onEvent,
 		onRegion,
 		progressive = false,
-		progressiveBatchRows = 32
+		progressiveBatchRows = 32,
+		progressiveDecodePreview,
+		progressiveMaxPreviewBytes = 64 * 1024 * 1024,
+		progressiveMaxPreviewPixels = 64 * 1024 * 1024
 	} = {}) {
 		if(!LibRaw.supportsIncrementalInput()) {
 			throw new Error('LibRaw incremental input requires SharedArrayBuffer and Atomics');
@@ -151,6 +154,9 @@ export default class LibRaw {
 		const progressiveDecoder = progressive
 			? new ProgressiveTiffDecoder(bytes, {
 				batchRows: progressiveBatchRows,
+				decodePreview: progressiveDecodePreview,
+				maxPreviewBytes: progressiveMaxPreviewBytes,
+				maxPreviewPixels: progressiveMaxPreviewPixels,
 				onEvent,
 				onRegion
 			})

@@ -111,21 +111,35 @@ await raw.openStream(response.body, settings, {
 			console.log('Use the normal full render:', event.reason);
 		}
 	},
-	onRegion({x, y, width, height, data}) {
-		uploadRgbaRegion(x, y, width, height, data);
+	onRegion({x, y, width, height, data, bitmap}) {
+		if (bitmap) {
+			uploadEmbeddedPreview(bitmap);
+		} else {
+			uploadRgbaRegion(x, y, width, height, data);
+		}
 	}
 });
 ```
 
-The progressive decoder intentionally supports only baseline uncompressed,
-chunky RGB or LinearRaw TIFF/DNG strips with uniform 8- or 16-bit samples.
-Those layouts expose deterministic completed scanlines, so every emitted RGBA
-region is orientation-correct, final-positioned, and emitted once. Compressed,
-planar, tiled, CFA, or otherwise unsafe layouts emit
+Baseline uncompressed, chunky RGB or LinearRaw TIFF/DNG strips with uniform
+8- or 16-bit samples expose deterministic completed scanlines. Every emitted
+RGBA region is orientation-correct, final-positioned, and emitted once.
+
+For TIFF-derived compressed or CFA RAW formats such as Sony ARW, the decoder
+walks the standard IFD/SubIFD chain and selects the largest bounded embedded
+JPEG. It publishes its final orientation-corrected dimensions as soon as the
+IFD chain is available and emits an `ImageBitmap` once only that JPEG byte
+range has arrived. The RAW sensor payload continues downloading and opening in
+LibRaw concurrently. Consumers own emitted bitmaps and should close them after
+upload when their rendering API does not consume the transfer.
+
+Layouts without safe scanlines or a standard embedded JPEG emit
 `progressive-image-fallback` and continue through the ordinary LibRaw path.
-Region memory is bounded by `progressiveBatchRows`; the decoder reads directly
+Scanline memory is bounded by `progressiveBatchRows`; embedded previews are
+bounded by `progressiveMaxPreviewBytes` (hard-capped at 64 MiB) and
+`progressiveMaxPreviewPixels` (hard-capped at 64 megapixels). The decoder reads
 from the existing shared incremental allocation and never creates another
-complete-file buffer.
+complete-RAW buffer.
 
 # Settings
 ```javascript

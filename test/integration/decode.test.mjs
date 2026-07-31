@@ -192,6 +192,55 @@ const withTimeout = (p, ms, label) => Promise.race([
 		}
 		progressiveRaw.dispose();
 
+		// Sony ARW stores a full-resolution JPEG before its much larger sensor
+		// payload. Discover its final geometry from the IFD chain, decode only
+		// that bounded range, and emit an ImageBitmap while the ARW response is
+		// still streaming.
+		const arwResponse = await fetch('/delayed-arw');
+		const arwRaw = new LibRaw();
+		const arwEvents = [];
+		let arwDownloadedBytes = 0;
+		let resolveArwRegion;
+		const arwRegionPromise = new Promise(resolve => {
+			resolveArwRegion = resolve;
+		});
+		const arwOpen = await arwRaw.openStream(
+			arwResponse.body,
+			{useCameraWb: true, outputBps: 8},
+			{
+				expectedSize: Number(arwResponse.headers.get('content-length')),
+				maxBytes: 64 * 1024 * 1024,
+				progressive: true,
+				onProgress: progress => {
+					arwDownloadedBytes = progress.bytesRead;
+				},
+				onEvent: event => arwEvents.push(event),
+				onRegion: region => {
+					const result = {
+						x: region.x,
+						y: region.y,
+						width: region.width,
+						height: region.height,
+						source: region.source,
+						hasBitmap: region.bitmap instanceof ImageBitmap,
+						downloadedBytes: arwDownloadedBytes,
+						timestamp: performance.now()
+					};
+					region.bitmap?.close();
+					resolveArwRegion(result);
+				}
+			}
+		);
+		const arwRegion = await withTimeout(arwRegionPromise, 10000, 'ARW progressive preview');
+		const arwInfo = arwEvents.find(
+			event => event.type === 'progressive-image-info'
+		);
+		const arwDownloadComplete = arwEvents.find(
+			event => event.type === 'download-complete'
+		);
+		const arwMeta = await arwRaw.metadata();
+		arwRaw.dispose();
+
 		// Abort must wake a datastream blocked in synchronous LibRaw code and
 		// cancel the browser stream rather than waiting for the server to finish.
 		const cancelController = new AbortController();
@@ -286,6 +335,13 @@ const withTimeout = (p, ms, label) => Promise.race([
 				progressiveFirstRegionAt < progressiveDownloadComplete?.timestamp,
 			progressiveDecodedWidth: progressiveDecoded?.width,
 			progressiveDecodeError,
+			arwBytes: arwOpen?.bytesRead,
+			arwInfo,
+			arwRegion,
+			arwPreviewBeforeDownloadComplete:
+				arwRegion?.timestamp > 0 &&
+				arwRegion.timestamp < arwDownloadComplete?.timestamp,
+			arwModel: arwMeta?.camera_model,
 			cancelRejected,
 			networkFailureRejected,
 			decoderFailureRejected,
@@ -320,11 +376,14 @@ const server = http.createServer(async (req, res) => {
 		url === '/delayed-known.dng' ||
 		url === '/delayed-unknown.dng' ||
 		url === '/slow-cancel.dng' ||
-		url === '/delayed-progressive.dng'
+		url === '/delayed-progressive.dng' ||
+		url === '/delayed-arw'
 	) {
 		const data = url === '/delayed-progressive.dng'
 			? PROGRESSIVE_FIXTURE
-			: await readFile(join(ROOT, 'test/integration/lossy.dng'));
+			: url === '/delayed-arw'
+				? await readFile(join(ROOT, FIXTURE))
+				: await readFile(join(ROOT, 'test/integration/lossy.dng'));
 		res.setHeader('Content-Type', 'application/octet-stream');
 		if (url !== '/delayed-unknown.dng') {
 			res.setHeader('Content-Length', data.byteLength);
@@ -333,6 +392,8 @@ const server = http.createServer(async (req, res) => {
 			? 256
 			: url === '/delayed-progressive.dng'
 				? 192
+				: url === '/delayed-arw'
+					? 256 * 1024
 				: 2048;
 		const delayMs = url === '/slow-cancel.dng'
 			? 60
@@ -340,7 +401,9 @@ const server = http.createServer(async (req, res) => {
 				? 30
 				: url === '/delayed-progressive.dng'
 					? 18
-				: 12;
+					: url === '/delayed-arw'
+						? 15
+					: 12;
 		let offset = 0;
 		let closed = false;
 		req.on('close', () => { closed = true; });
@@ -461,6 +524,26 @@ if (r && r.ok) {
 		r.progressiveDecodedWidth > 0 && r.progressiveDecodeError == null,
 		`progressive LinearRaw DNG remains decodable by LibRaw (width=${r.progressiveDecodedWidth}, error=${r.progressiveDecodeError})`
 	);
+	check(
+		r.arwInfo?.format === 'embedded-jpeg' &&
+			r.arwInfo?.width === 6192 &&
+			r.arwInfo?.height === 4128 &&
+			r.arwInfo?.orientation === 1,
+		`ARW publishes early final preview geometry (${r.arwInfo?.width}x${r.arwInfo?.height}, ${r.arwInfo?.format})`
+	);
+	check(
+		r.arwRegion?.hasBitmap &&
+			r.arwRegion?.source === 'embedded-jpeg' &&
+			r.arwRegion?.width === 6192 &&
+			r.arwRegion?.height === 4128,
+		`ARW emits its embedded preview ImageBitmap (${r.arwRegion?.width}x${r.arwRegion?.height})`
+	);
+	check(
+		r.arwPreviewBeforeDownloadComplete &&
+			r.arwRegion?.downloadedBytes < r.arwBytes,
+		`ARW preview arrives before download completion (${r.arwRegion?.downloadedBytes}/${r.arwBytes} bytes)`
+	);
+	check(r.arwModel === 'ILME-FX30', `streamed ARW remains open in LibRaw (${r.arwModel})`);
 	check(r.cancelRejected, 'incremental input rejects immediately with AbortError on cancellation');
 	check(r.networkFailureRejected, 'incremental input propagates producer/network failure');
 	check(r.decoderFailureRejected, 'incremental input propagates decoder failure');

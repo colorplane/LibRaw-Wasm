@@ -66,3 +66,64 @@ export function makeRgbDng({
 	}
 	return {bytes, pixelOffset, rowBytes};
 }
+
+export function makeEmbeddedJpegRaw({
+	width = 8,
+	height = 6,
+	orientation = 1,
+	jpegLength = 128,
+	trailingBytes = 1024
+} = {}) {
+	const firstIfdOffset = 8;
+	const firstEntries = 2;
+	const firstIfdSize = 2 + firstEntries * 12 + 4;
+	const previewIfdOffset = firstIfdOffset + firstIfdSize;
+	const previewEntries = 6;
+	const previewIfdSize = 2 + previewEntries * 12 + 4;
+	const jpegOffset = previewIfdOffset + previewIfdSize + 64;
+	const totalBytes = jpegOffset + jpegLength + trailingBytes;
+	const bytes = new Uint8Array(totalBytes);
+	const view = new DataView(bytes.buffer);
+	const u16 = (offset, value) => view.setUint16(offset, value, true);
+	const u32 = (offset, value) => view.setUint32(offset, value, true);
+	const writeIfd = (offset, entries, nextOffset) => {
+		u16(offset, entries.length);
+		let entryOffset = offset + 2;
+		for(const [tag, type, value] of entries) {
+			u16(entryOffset, tag);
+			u16(entryOffset + 2, type);
+			u32(entryOffset + 4, 1);
+			if(type === 3) u16(entryOffset + 8, value);
+			else u32(entryOffset + 8, value);
+			entryOffset += 12;
+		}
+		u32(entryOffset, nextOffset);
+	};
+
+	bytes.set([0x49, 0x49]);
+	u16(2, 42);
+	u32(4, firstIfdOffset);
+	writeIfd(firstIfdOffset, [
+		[259, 3, 6],
+		[274, 3, orientation]
+	], previewIfdOffset);
+	writeIfd(previewIfdOffset, [
+		[256, 4, width],
+		[257, 4, height],
+		[259, 3, 7],
+		[274, 3, orientation],
+		[513, 4, jpegOffset],
+		[514, 4, jpegLength]
+	], 0);
+	bytes[jpegOffset] = 0xff;
+	bytes[jpegOffset + 1] = 0xd8;
+	bytes.fill(0x5a, jpegOffset + 2, jpegOffset + jpegLength - 2);
+	bytes[jpegOffset + jpegLength - 2] = 0xff;
+	bytes[jpegOffset + jpegLength - 1] = 0xd9;
+	return {
+		bytes,
+		jpegOffset,
+		jpegLength,
+		metadataBytes: previewIfdOffset + previewIfdSize
+	};
+}

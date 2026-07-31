@@ -24,8 +24,13 @@ const TAG_SAMPLES_PER_PIXEL = 277;
 const TAG_ROWS_PER_STRIP = 278;
 const TAG_STRIP_BYTE_COUNTS = 279;
 const TAG_PLANAR_CONFIGURATION = 284;
+const TAG_SUB_IFDS = 330;
+const TAG_JPEG_OFFSET = 513;
+const TAG_JPEG_LENGTH = 514;
 const PHOTOMETRIC_RGB = 2;
 const PHOTOMETRIC_LINEAR_RAW = 34892;
+const DEFAULT_MAX_PREVIEW_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_PREVIEW_PIXELS = 64 * 1024 * 1024;
 
 function orientedSize(width, height, orientation) {
 	return orientation >= 5 && orientation <= 8
@@ -70,9 +75,48 @@ function normalizedOrientation(value) {
 	return orientation >= 1 && orientation <= 8 ? orientation : 1;
 }
 
+function orientationExifSegment(orientation) {
+	return new Uint8Array([
+		0xff, 0xe1, 0x00, 0x22,
+		0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+		0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08,
+		0x00, 0x01,
+		0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01,
+		0x00, Math.min(8, Math.max(1, orientation)), 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00
+	]);
+}
+
+async function decodeEmbeddedJpeg(bytes, orientation) {
+	if(typeof createImageBitmap !== 'function' || typeof Blob !== 'function') {
+		throw new Error('Embedded JPEG decoding is unavailable');
+	}
+	if(bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+		throw new Error('Embedded preview is not a JPEG');
+	}
+	const parts = orientation > 1
+		? [
+			bytes.subarray(0, 2),
+			orientationExifSegment(orientation),
+			bytes.subarray(2)
+		]
+		: [bytes];
+	const bitmap = await createImageBitmap(
+		new Blob(parts, {type: 'image/jpeg'}),
+		{imageOrientation: 'from-image'}
+	);
+	return {
+		bitmap,
+		width: bitmap.width,
+		height: bitmap.height
+	};
+}
+
 /**
  * Incrementally decodes completed scanlines from baseline uncompressed,
- * chunky RGB or LinearRaw TIFF/DNG strips.
+ * chunky RGB or LinearRaw TIFF/DNG strips. TIFF-derived RAW formats with an
+ * embedded JPEG preview emit that preview as an ImageBitmap as soon as its
+ * byte range is complete, without waiting for the sensor payload.
  *
  * The decoder reads directly from the shared incremental input allocation. It
  * never owns a complete-file copy and emits each source scanline exactly once.
@@ -80,11 +124,29 @@ function normalizedOrientation(value) {
 export class ProgressiveTiffDecoder {
 	constructor(bytes, {
 		batchRows = 32,
+		decodePreview = decodeEmbeddedJpeg,
+		maxPreviewBytes = DEFAULT_MAX_PREVIEW_BYTES,
+		maxPreviewPixels = DEFAULT_MAX_PREVIEW_PIXELS,
 		onEvent,
 		onRegion
 	} = {}) {
 		this.bytes = bytes;
 		this.batchRows = Math.max(1, Math.min(256, Math.trunc(batchRows) || 32));
+		this.decodePreview = decodePreview;
+		this.maxPreviewBytes = Math.max(
+			1,
+			Math.min(
+				DEFAULT_MAX_PREVIEW_BYTES,
+				Math.trunc(maxPreviewBytes) || DEFAULT_MAX_PREVIEW_BYTES
+			)
+		);
+		this.maxPreviewPixels = Math.max(
+			1,
+			Math.min(
+				DEFAULT_MAX_PREVIEW_PIXELS,
+				Math.trunc(maxPreviewPixels) || DEFAULT_MAX_PREVIEW_PIXELS
+			)
+		);
 		this.onEvent = onEvent;
 		this.onRegion = onRegion;
 		this.available = 0;
@@ -94,6 +156,7 @@ export class ProgressiveTiffDecoder {
 		this.fallbackPublished = false;
 		this.completed = false;
 		this.started = false;
+		this.previewDecodeStarted = false;
 	}
 
 	push(available) {
@@ -107,14 +170,18 @@ export class ProgressiveTiffDecoder {
 				return;
 			}
 			this.layout = parsed;
-			this.nextRows = new Array(parsed.stripOffsets.length).fill(0);
+			this.nextRows = parsed.kind === 'embedded-jpeg'
+				? []
+				: new Array(parsed.stripOffsets.length).fill(0);
 			this.started = true;
 			this.onEvent?.({
 				type: 'progressive-image-info',
 				timestamp: performance.now(),
-				format: parsed.photometric === PHOTOMETRIC_LINEAR_RAW
-					? 'linear-raw-tiff'
-					: 'rgb-tiff',
+				format: parsed.kind === 'embedded-jpeg'
+					? 'embedded-jpeg'
+					: parsed.photometric === PHOTOMETRIC_LINEAR_RAW
+						? 'linear-raw-tiff'
+						: 'rgb-tiff',
 				width: parsed.outputWidth,
 				height: parsed.outputHeight,
 				sourceWidth: parsed.width,
@@ -129,12 +196,24 @@ export class ProgressiveTiffDecoder {
 	finish(available) {
 		if(this.completed) return;
 		this.push(available);
-		this.completed = true;
 		if(this.fallbackPublished) return;
 		if(!this.layout) {
+			this.completed = true;
 			this.publishFallback('truncated-or-unsupported-tiff');
 			return;
 		}
+		if(this.layout.kind === 'embedded-jpeg') {
+			if(!this.previewDecodeStarted) {
+				this.completed = true;
+				this.publishFallback('truncated-embedded-preview', {
+					width: this.layout.outputWidth,
+					height: this.layout.outputHeight,
+					orientation: this.layout.orientation
+				});
+			}
+			return;
+		}
+		this.completed = true;
 		this.decodeAvailableRows();
 		const totalPixels = this.layout.width * this.layout.height;
 		if(this.decodedPixels !== totalPixels) {
@@ -247,6 +326,15 @@ export class ProgressiveTiffDecoder {
 			const values = readValues(tag);
 			return values?.length ? values[0] : fallback;
 		};
+		const embeddedOr = reason => {
+			const embedded = this.parseEmbeddedPreview(
+				view,
+				littleEndian,
+				ifdOffset,
+				normalizedOrientation(scalar(TAG_ORIENTATION, 1))
+			);
+			return embedded || {reason};
+		};
 
 		const width = scalar(TAG_IMAGE_WIDTH, 0);
 		const height = scalar(TAG_IMAGE_HEIGHT, 0);
@@ -260,21 +348,28 @@ export class ProgressiveTiffDecoder {
 			orientation
 		};
 		if(!width || !height || width > 100000 || height > 100000) {
-			return {reason: 'invalid-image-dimensions', info};
+			const embedded = embeddedOr('invalid-image-dimensions');
+			return embedded.info ? embedded : {...embedded, info};
 		}
 		const compression = scalar(TAG_COMPRESSION, 1);
-		if(compression !== 1) return {reason: 'compressed-pixel-data', info};
+		if(compression !== 1) {
+			const embedded = embeddedOr('compressed-pixel-data');
+			return embedded.info ? embedded : {...embedded, info};
+		}
 		const photometric = scalar(TAG_PHOTOMETRIC, 0);
 		if(photometric !== PHOTOMETRIC_RGB &&
 			photometric !== PHOTOMETRIC_LINEAR_RAW) {
-			return {reason: 'unsupported-photometric-interpretation', info};
+			const embedded = embeddedOr('unsupported-photometric-interpretation');
+			return embedded.info ? embedded : {...embedded, info};
 		}
 		const samples = scalar(TAG_SAMPLES_PER_PIXEL, 1);
 		if(samples !== 3 && samples !== 4) {
-			return {reason: 'unsupported-sample-count', info};
+			const embedded = embeddedOr('unsupported-sample-count');
+			return embedded.info ? embedded : {...embedded, info};
 		}
 		if(scalar(TAG_PLANAR_CONFIGURATION, 1) !== 1) {
-			return {reason: 'planar-pixel-data', info};
+			const embedded = embeddedOr('planar-pixel-data');
+			return embedded.info ? embedded : {...embedded, info};
 		}
 		const bits = readValues(TAG_BITS_PER_SAMPLE);
 		if(bits === null) return {pending: true};
@@ -313,6 +408,7 @@ export class ProgressiveTiffDecoder {
 		}
 
 		return {
+			kind: 'scanlines',
 			littleEndian,
 			width,
 			height,
@@ -330,9 +426,117 @@ export class ProgressiveTiffDecoder {
 		};
 	}
 
+	parseEmbeddedPreview(view, littleEndian, firstIfdOffset, rootOrientation) {
+		const u16 = offset => view.getUint16(offset, littleEndian);
+		const u32 = offset => view.getUint32(offset, littleEndian);
+		const queue = [firstIfdOffset];
+		const visited = new Set();
+		const candidates = [];
+		while(queue.length) {
+			const ifdOffset = queue.shift();
+			if(!ifdOffset || visited.has(ifdOffset)) continue;
+			if(visited.size >= 64 ||
+				ifdOffset > this.bytes.byteLength - 2) {
+				return {reason: 'invalid-embedded-preview-ifd'};
+			}
+			if(this.available < ifdOffset + 2) return {pending: true};
+			visited.add(ifdOffset);
+			const entryCount = u16(ifdOffset);
+			if(entryCount > 4096) return {reason: 'invalid-embedded-preview-ifd'};
+			const entriesEnd = ifdOffset + 2 + entryCount * 12;
+			const nextOffsetPosition = entriesEnd;
+			if(nextOffsetPosition > this.bytes.byteLength - 4) {
+				return {reason: 'invalid-embedded-preview-ifd'};
+			}
+			if(this.available < nextOffsetPosition + 4) return {pending: true};
+			const entries = new Map();
+			for(let index = 0; index < entryCount; index++) {
+				const offset = ifdOffset + 2 + index * 12;
+				const tag = u16(offset);
+				const type = u16(offset + 2);
+				const count = u32(offset + 4);
+				const typeSize = TIFF_TYPES.get(type);
+				if(!typeSize || count > 0x7fffffff / typeSize) continue;
+				const size = count * typeSize;
+				const valueOffset = size <= 4 ? offset + 8 : u32(offset + 8);
+				entries.set(tag, {type, count, size, valueOffset});
+			}
+			const readValues = tag => {
+				const entry = entries.get(tag);
+				if(!entry) return undefined;
+				if(entry.valueOffset + entry.size > this.bytes.byteLength) {
+					return undefined;
+				}
+				if(entry.valueOffset + entry.size > this.available) return null;
+				const values = [];
+				for(let index = 0; index < entry.count; index++) {
+					const typeSize = TIFF_TYPES.get(entry.type);
+					const offset = entry.valueOffset + index * typeSize;
+					if(entry.type === 1 || entry.type === 7) values.push(this.bytes[offset]);
+					else if(entry.type === 3) values.push(u16(offset));
+					else if(entry.type === 4) values.push(u32(offset));
+					else return undefined;
+				}
+				return values;
+			};
+			const scalar = (tag, fallback = 0) => {
+				const values = readValues(tag);
+				return values?.length ? values[0] : fallback;
+			};
+			const subIfds = readValues(TAG_SUB_IFDS);
+			if(subIfds === null) return {pending: true};
+			if(subIfds) queue.push(...subIfds);
+			const nextOffset = u32(nextOffsetPosition);
+			if(nextOffset) queue.push(nextOffset);
+
+			const width = scalar(TAG_IMAGE_WIDTH);
+			const height = scalar(TAG_IMAGE_HEIGHT);
+			const offset = scalar(TAG_JPEG_OFFSET);
+			const length = scalar(TAG_JPEG_LENGTH);
+			const compression = scalar(TAG_COMPRESSION, 1);
+			const orientation = normalizedOrientation(
+				scalar(TAG_ORIENTATION, rootOrientation)
+			);
+			if(width > 0 && height > 0 &&
+				width <= 100000 && height <= 100000 &&
+				width * height <= this.maxPreviewPixels &&
+				offset > 0 && length > 0 &&
+				(compression === 6 || compression === 7) &&
+				length <= this.maxPreviewBytes &&
+				offset <= this.bytes.byteLength - length) {
+				candidates.push({width, height, offset, length, orientation});
+			}
+		}
+		if(!candidates.length) return null;
+		candidates.sort((a, b) =>
+			b.width * b.height - a.width * a.height ||
+			b.length - a.length
+		);
+		const preview = candidates[0];
+		const output = orientedSize(
+			preview.width,
+			preview.height,
+			preview.orientation
+		);
+		return {
+			kind: 'embedded-jpeg',
+			width: preview.width,
+			height: preview.height,
+			outputWidth: output.width,
+			outputHeight: output.height,
+			orientation: preview.orientation,
+			offset: preview.offset,
+			length: preview.length
+		};
+	}
+
 	decodeAvailableRows() {
 		const layout = this.layout;
 		if(!layout) return;
+		if(layout.kind === 'embedded-jpeg') {
+			this.decodeAvailablePreview();
+			return;
+		}
 		for(let strip = 0; strip < layout.stripOffsets.length; strip++) {
 			const y = strip * layout.rowsPerStrip;
 			const rows = Math.min(layout.rowsPerStrip, layout.height - y);
@@ -356,6 +560,63 @@ export class ProgressiveTiffDecoder {
 				this.nextRows[strip] += rowCount;
 			}
 		}
+	}
+
+	decodeAvailablePreview() {
+		const layout = this.layout;
+		if(this.previewDecodeStarted ||
+			this.available < layout.offset + layout.length) return;
+		this.previewDecodeStarted = true;
+		const encoded = this.bytes.slice(
+			layout.offset,
+			layout.offset + layout.length
+		);
+		Promise.resolve(this.decodePreview(encoded, layout.orientation))
+			.then(decoded => {
+				if(this.completed) {
+					decoded?.bitmap?.close?.();
+					return;
+				}
+				if(!decoded?.bitmap ||
+					decoded.width !== layout.outputWidth ||
+					decoded.height !== layout.outputHeight) {
+					decoded?.bitmap?.close?.();
+					throw new Error(
+						`Embedded preview dimensions ${decoded?.width}x${decoded?.height} ` +
+						`do not match ${layout.outputWidth}x${layout.outputHeight}`
+					);
+				}
+				this.decodedPixels = layout.width * layout.height;
+				this.onRegion?.({
+					x: 0,
+					y: 0,
+					width: layout.outputWidth,
+					height: layout.outputHeight,
+					bitmap: decoded.bitmap,
+					decodedPixels: this.decodedPixels,
+					totalPixels: this.decodedPixels,
+					source: 'embedded-jpeg'
+				});
+				if(!this.onRegion) decoded.bitmap.close?.();
+				this.completed = true;
+				this.onEvent?.({
+					type: 'progressive-image-complete',
+					timestamp: performance.now(),
+					decodedPixels: this.decodedPixels,
+					totalPixels: this.decodedPixels,
+					source: 'embedded-jpeg'
+				});
+			})
+			.catch(error => {
+				if(this.completed) return;
+				this.completed = true;
+				this.publishFallback('embedded-preview-decode-failed', {
+					width: layout.outputWidth,
+					height: layout.outputHeight,
+					orientation: layout.orientation,
+					error: error?.message || String(error)
+				});
+			});
 	}
 
 	emitRows(strip, firstRow, rowCount) {
