@@ -682,6 +682,8 @@ export interface RawImageData {
 export interface RawSensorData {
   raw_width: number;
   raw_height: number;
+  /** Source sensor-row stride in bytes before `data` is tightly repacked. */
+  raw_pitch: number;
   top_margin: number;
   left_margin: number;
   width: number;
@@ -698,6 +700,8 @@ export interface RawSensorData {
 export interface RawSensorPreviewData {
   raw_width: number;
   raw_height: number;
+  /** Source sensor-row stride in bytes. */
+  raw_pitch: number;
   top_margin: number;
   left_margin: number;
   width: number;

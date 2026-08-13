@@ -234,6 +234,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 			renderedPreviewColors: renderedPreview?.colors,
 			renderedPreviewLen: renderedPreview?.data?.length,
 			renderedPreviewCtor: renderedPreview?.data?.constructor?.name,
+			rawW: rawImg?.raw_width, rawH: rawImg?.raw_height, rawPitch: rawImg?.raw_pitch,
 			rawLen: rawImg?.data?.length, rawCtor: rawImg?.data?.constructor?.name,
 			previewW: rawPreview?.preview_width, previewH: rawPreview?.preview_height,
 			previewLen: rawPreview?.data?.length, previewCtor: rawPreview?.data?.constructor?.name,
@@ -341,6 +342,8 @@ if (r && r.ok) {
 		`renderPreview() honors outputBps (got ${r.renderedPreviewCtor})`);
 	check(r.rawLen === 6272 * 4168, `rawImageData full mosaic length (got ${r.rawLen})`);
 	check(r.rawCtor === 'Uint16Array', `rawImageData is Uint16Array (got ${r.rawCtor})`);
+	check(r.rawLen === r.rawW * r.rawH, 'rawImageData returns tightly packed sensor rows');
+	check(r.rawPitch >= r.rawW * 2, `rawImageData reports source row pitch (got ${r.rawPitch})`);
 	check(r.previewW === 1024 && r.previewH === 681, `rawImagePreview fits 1024px (got ${r.previewW}x${r.previewH})`);
 	check(r.previewLen === r.previewW * r.previewH * 4, `rawImagePreview has RGBA16 samples (got ${r.previewLen})`);
 	check(r.previewCtor === 'Uint16Array', `rawImagePreview is Uint16Array (got ${r.previewCtor})`);

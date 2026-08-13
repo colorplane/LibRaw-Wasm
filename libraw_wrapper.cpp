@@ -1467,9 +1467,29 @@ public:
 		resultObj.set("left_margin", sizes.left_margin);
 		resultObj.set("height",      sizes.height);
 		resultObj.set("width",       sizes.width);
+		const size_t packedRowBytes =
+			static_cast<size_t>(sizes.raw_width) * sizeof(uint16_t);
+		const size_t sourceRowBytes = sizes.raw_pitch >= packedRowBytes
+			? static_cast<size_t>(sizes.raw_pitch)
+			: packedRowBytes;
+		resultObj.set("raw_pitch", static_cast<unsigned>(sourceRowBytes));
 
-		size_t pixelCount = static_cast<size_t>(sizes.raw_height) * static_cast<size_t>(sizes.raw_width);
-		resultObj.set("data", toJSTypedArray(16, pixelCount * 2, (uint8_t*)raw.raw_image));
+		const size_t pixelCount =
+			static_cast<size_t>(sizes.raw_height) * static_cast<size_t>(sizes.raw_width);
+		val typedArray = val::global("Uint16Array").new_(val(static_cast<unsigned>(pixelCount)));
+		for (unsigned row = 0; row < sizes.raw_height; ++row) {
+			auto *source = reinterpret_cast<uint16_t*>(
+			reinterpret_cast<uint8_t*>(raw.raw_image) +
+				static_cast<size_t>(row) * sourceRowBytes
+			);
+			val rowView = val(typed_memory_view(sizes.raw_width, source));
+			typedArray.call<void>(
+				"set",
+				rowView,
+				val(static_cast<unsigned>(static_cast<size_t>(row) * sizes.raw_width))
+			);
+		}
+		resultObj.set("data", typedArray);
 
 		return resultObj;
 	}
@@ -1491,6 +1511,11 @@ public:
 		if (!raw.raw_image || !sizes.raw_width || !sizes.raw_height) {
 			return val::undefined();
 		}
+		const size_t packedRowBytes =
+			static_cast<size_t>(sizes.raw_width) * sizeof(uint16_t);
+		const size_t sourceRowBytes = sizes.raw_pitch >= packedRowBytes
+			? static_cast<size_t>(sizes.raw_pitch)
+			: packedRowBytes;
 
 		const unsigned safeMaxDimension = std::max(1u, maxDimension);
 		const double scale = std::min(
@@ -1563,9 +1588,12 @@ public:
 					sourceLeft + patternSize
 				);
 				for (unsigned y = sourceTop; y < sampleBottom; ++y) {
-					const size_t rowOffset = static_cast<size_t>(y) * sizes.raw_width;
+					auto *sourceRow = reinterpret_cast<uint16_t*>(
+						reinterpret_cast<uint8_t*>(raw.raw_image) +
+						static_cast<size_t>(y) * sourceRowBytes
+					);
 					for (unsigned x = sourceLeft; x < sampleRight; ++x) {
-						const uint16_t sample = raw.raw_image[rowOffset + x];
+						const uint16_t sample = sourceRow[x];
 						monoSum += sample;
 						++monoCount;
 						const auto filters = processor_->imgdata.idata.filters;
@@ -1604,6 +1632,7 @@ public:
 		resultObj.set("left_margin", sizes.left_margin);
 		resultObj.set("height", sizes.height);
 		resultObj.set("width", sizes.width);
+		resultObj.set("raw_pitch", static_cast<unsigned>(sourceRowBytes));
 		resultObj.set("preview_width", previewWidth);
 		resultObj.set("preview_height", previewHeight);
 		resultObj.set(
