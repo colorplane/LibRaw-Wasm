@@ -37,8 +37,13 @@ if [ "${FORCE_LIBS:-0}" = "1" ] || [ ! -f libs/libraw.a ] || [ ! -f libs/liblcms
 	#-------------------------------------------------------------------------------
 	# 1) Download & Prepare LibRaw
 	#-------------------------------------------------------------------------------
-	echo -e "\n==> Cloning LibRaw from GitHub (0.22.1)..."
-	git clone --branch 0.22.1 --depth 1 https://github.com/LibRaw/LibRaw.git LibRawSource
+	# Pin Colorplane's privacy-preserving fork. This revision leaves Sony's
+	# encrypted SR2 metadata block opaque while retaining public RAW decoding.
+	LIBRAW_REPOSITORY="https://github.com/colorplane/LibRaw.git"
+	LIBRAW_REVISION="bb680d9ab7d2747faccbdd2e285cf07cd7a2e04f"
+	echo -e "\n==> Cloning Colorplane LibRaw (${LIBRAW_REVISION})..."
+	git clone --filter=blob:none --no-checkout "${LIBRAW_REPOSITORY}" LibRawSource
+	git -C LibRawSource checkout --detach "${LIBRAW_REVISION}"
 
 	pushd LibRawSource
 
@@ -66,7 +71,7 @@ if [ "${FORCE_LIBS:-0}" = "1" ] || [ ! -f libs/libraw.a ] || [ ! -f libs/liblcms
 	# with -s USE_LIBJPEG=1.
 	emconfigure ./configure \
 	  --host=wasm32-unknown-emscripten \
-	  --enable-openmp \
+	  --disable-openmp \
 	  --enable-lcms \
 	  --enable-jpeg \
 	  --disable-shared \
