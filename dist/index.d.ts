@@ -689,6 +689,14 @@ export interface RawSensorData {
   width: number;
   height: number;
   data: Uint16Array;
+  /** Worker-side decode stages, excluding worker startup and message delivery. */
+  timings: {
+    decoder: string;
+    inputCopyMs: number;
+    identifyMs: number;
+    unpackMs: number;
+    sensorCopyMs: number;
+  };
 }
 
 /**

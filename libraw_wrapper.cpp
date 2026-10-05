@@ -9,6 +9,7 @@
 
 // Emscripten Embind
 #include <emscripten/bind.h>
+#include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
 
 // LibRaw includes
@@ -259,8 +260,12 @@ public:
 
 		applySettings(settings);
 
-        buffer = toNativeVector(jsBuffer);
-		int ret = processor_->open_buffer((void*)buffer.data(), buffer.size());
+		const double copyStart = emscripten_get_now();
+		copyInputToNativeBuffer(jsBuffer);
+		inputCopyMs = emscripten_get_now() - copyStart;
+		const double identifyStart = emscripten_get_now();
+		int ret = processor_->open_buffer(buffer.get(), bufferSize);
+		identifyMs = emscripten_get_now() - identifyStart;
 		if (ret != LIBRAW_SUCCESS) {
 			throw std::runtime_error("LibRaw: open_buffer() failed with code " + std::to_string(ret));
 		}
@@ -275,7 +280,10 @@ public:
 		}
 		resetIncrementalInput();
 		processor_->recycle();
-		std::vector<uint8_t>().swap(buffer);
+		buffer.reset();
+		bufferSize = 0;
+		inputCopyMs = 0;
+		identifyMs = 0;
 		isUnpacked = false;
 		isProcessed = false;
 		applySettings(settings);
@@ -1450,7 +1458,9 @@ public:
 		}
 
 		// Unpack (but not dcraw_process) so we keep the raw mosaic.
+		const double unpackStart = emscripten_get_now();
 		ensureUnpacked();
+		const double unpackMs = emscripten_get_now() - unpackStart;
 
 		auto &raw = processor_->imgdata.rawdata;
 		auto &sizes = processor_->imgdata.sizes;
@@ -1476,20 +1486,38 @@ public:
 
 		const size_t pixelCount =
 			static_cast<size_t>(sizes.raw_height) * static_cast<size_t>(sizes.raw_width);
-		val typedArray = val::global("Uint16Array").new_(val(static_cast<unsigned>(pixelCount)));
-		for (unsigned row = 0; row < sizes.raw_height; ++row) {
-			auto *source = reinterpret_cast<uint16_t*>(
-			reinterpret_cast<uint8_t*>(raw.raw_image) +
-				static_cast<size_t>(row) * sourceRowBytes
-			);
-			val rowView = val(typed_memory_view(sizes.raw_width, source));
-			typedArray.call<void>(
-				"set",
-				rowView,
-				val(static_cast<unsigned>(static_cast<size_t>(row) * sizes.raw_width))
-			);
+		const double copyStart = emscripten_get_now();
+		val typedArray = val::undefined();
+		if (sourceRowBytes == packedRowBytes) {
+			// Normal Bayer planes are contiguous. Copy once across the WASM/JS
+			// boundary; the owned JS buffer remains safe after recycle/dispose.
+			typedArray = toJSTypedArray(16, pixelCount * sizeof(uint16_t),
+				reinterpret_cast<uint8_t*>(raw.raw_image));
+		} else {
+			typedArray = val::global("Uint16Array").new_(val(static_cast<unsigned>(pixelCount)));
+			for (unsigned row = 0; row < sizes.raw_height; ++row) {
+				auto *source = reinterpret_cast<uint16_t*>(
+					reinterpret_cast<uint8_t*>(raw.raw_image) +
+					static_cast<size_t>(row) * sourceRowBytes
+				);
+				val rowView = val(typed_memory_view(sizes.raw_width, source));
+				typedArray.call<void>(
+					"set",
+					rowView,
+					val(static_cast<unsigned>(static_cast<size_t>(row) * sizes.raw_width))
+				);
+			}
 		}
 		resultObj.set("data", typedArray);
+		val timings = val::object();
+		libraw_decoder_info_t decoderInfo;
+		processor_->get_decoder_info(&decoderInfo);
+		timings.set("decoder", std::string(decoderInfo.decoder_name));
+		timings.set("inputCopyMs", inputCopyMs);
+		timings.set("identifyMs", identifyMs);
+		timings.set("unpackMs", unpackMs);
+		timings.set("sensorCopyMs", emscripten_get_now() - copyStart);
+		resultObj.set("timings", timings);
 
 		return resultObj;
 	}
@@ -1648,7 +1676,8 @@ public:
 
 private:
 	LibRaw* processor_ = nullptr;
-    std::vector<uint8_t> buffer;
+	std::unique_ptr<uint8_t[]> buffer;
+	size_t bufferSize = 0;
 	std::unique_ptr<unsigned char[]> incrementalBuffer_;
 	std::unique_ptr<IncrementalDatastream> incrementalStream_;
 	alignas(4) uint32_t incrementalControl_[INPUT_CONTROL_WORDS] = {};
@@ -1656,6 +1685,8 @@ private:
 	size_t incrementalExpectedSize_ = 0;
 	bool isUnpacked = false;
 	bool isProcessed = false;
+	double inputCopyMs = 0;
+	double identifyMs = 0;
 
 	void ensureUnpacked() {
 		if (isUnpacked) return;
@@ -1948,8 +1979,9 @@ private:
 			setStringMember(params.dark_frame, settings["darkFrame"].as<std::string>());
 		}
 	}
-	// Convert a JS Uint8Array to a std::vector<uint8_t>
-	std::vector<uint8_t> toNativeVector(const val &jsBufLike) {
+	// Copy the complete input once; value-initializing a vector would first
+	// zero every byte of a large RAW that this copy immediately overwrites.
+	void copyInputToNativeBuffer(const val &jsBufLike) {
         const val Uint8Array = val::global("Uint8Array");
         const val ArrayBuffer = val::global("ArrayBuffer");
 
@@ -1963,13 +1995,13 @@ private:
                                         jsBufLike["byteLength"]));
 
         const size_t n = u8["byteLength"].as<size_t>();
-        std::vector<uint8_t> out(n);
+		buffer.reset();
+		bufferSize = n;
+		buffer.reset(new uint8_t[n]);
 
         // Create a Uint8Array view into WASM memory and copy JS -> WASM in one go
-        val wasmView = val(emscripten::typed_memory_view(out.size(), out.data()));
+        val wasmView = val(emscripten::typed_memory_view(n, buffer.get()));
         wasmView.call<void>("set", u8);   // single memcpy under the hood
-
-        return out;
 	}
 
     val toJSTypedArray(size_t bits, size_t data_size, uint8_t *data) {

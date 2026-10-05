@@ -49,6 +49,17 @@ const withTimeout = (p, ms, label) => Promise.race([
 		const rawPreview = await raw.rawImagePreview(1024);
 		const rawImg = await raw.rawImageData();
 		const thumb = await raw.thumbnailData();
+		const repeatedSensor = await raw.rawImageData();
+		let sensorCopiesEqual = rawImg.data.length === repeatedSensor.data.length;
+		for (let i = 0; sensorCopiesEqual && i < rawImg.data.length; i++) {
+			sensorCopiesEqual = rawImg.data[i] === repeatedSensor.data[i];
+		}
+		const retainedFirstPixel = rawImg.data[0];
+		repeatedSensor.data[0] ^= 1;
+		const sensorCopiesIndependent = rawImg.data[0] === retainedFirstPixel;
+		raw.dispose();
+		const sensorSurvivesDispose = rawImg.data.length === rawImg.raw_width * rawImg.raw_height &&
+			rawImg.data[0] === retainedFirstPixel;
 
 		// Concurrency: the exact Promise.all scenario that used to hang.
 		const reuse = new LibRaw();
@@ -207,6 +218,8 @@ const withTimeout = (p, ms, label) => Promise.race([
 
 		window.__RESULT = {
 			ok: true,
+			sensorCopiesEqual, sensorCopiesIndependent, sensorSurvivesDispose,
+			sensorTimings: rawImg.timings,
 			model: meta?.camera_model,
 			dngW: dngImg?.width, dngH: dngImg?.height, dngColors: dngImg?.colors,
 			dngLen: dngImg?.data?.length, dngCtor: dngImg?.data?.constructor?.name,
@@ -329,6 +342,11 @@ const checks = [];
 const check = (cond, msg) => checks.push({ ok: !!cond, msg });
 check(r && r.ok, 'page ran without error');
 if (r && r.ok) {
+	check(r.sensorCopiesEqual, 'bulk sensor copies preserve every sample across repeated reads');
+	check(r.sensorCopiesIndependent, 'sensor copies have independent owned buffers');
+	check(r.sensorSurvivesDispose, 'sensor pixels remain available after the decoder is disposed');
+	check(r.sensorTimings && ['inputCopyMs', 'identifyMs', 'unpackMs', 'sensorCopyMs'].every(key =>
+		Number.isFinite(r.sensorTimings[key]) && r.sensorTimings[key] >= 0), 'sensor stages report finite worker-side timings');
 	check(r.model === 'ILME-FX30', `model is ILME-FX30 (got ${r.model})`);
 	check(r.tsYear && r.tsYear >= 2020, `timestamp scaled to a real year (got ${r.tsIso})`);
 	check(r.imgW === 6240 && r.imgH === 4168, `imageData full dims 6240x4168 (got ${r.imgW}x${r.imgH})`);
