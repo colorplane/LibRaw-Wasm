@@ -87,6 +87,16 @@ export default class LibRaw {
 		return await this.runFn('open', buffer, settings);
 	}
 
+	/** Wait for WASM initialization without opening an image. */
+	async warmup() {
+		await this.runFn('warmup');
+	}
+
+	/** Read a File/Blob inside the decoder worker, keeping its bytes off the UI heap. */
+	async openBlob(blob, settings) {
+		return await this.runFn('openBlob', blob, settings);
+	}
+
 	/**
 	 * Incrementally open RAW data from a ReadableStream or async iterable.
 	 *

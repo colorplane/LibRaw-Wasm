@@ -63,12 +63,16 @@ const withTimeout = (p, ms, label) => Promise.race([
 
 		// Concurrency: the exact Promise.all scenario that used to hang.
 		const reuse = new LibRaw();
+		await reuse.warmup();
 		await reuse.open(bytes(), { useCameraWb: true, halfSize: true });
 		const [cMeta, cImg] = await withTimeout(
 			Promise.all([reuse.metadata(), reuse.imageData()]), 20000, 'Promise.all');
 
 		// Instance reuse: a 2nd open() on the same instance must reflect new settings.
-		await reuse.open(bytes(), { useCameraWb: true, halfSize: false });
+		const blobOpenTimings = await reuse.openBlob(new Blob([buf]), { useCameraWb: true, halfSize: false });
+		const blobSensor = await reuse.rawImageData();
+		const blobSensorEqual = blobSensor.data.length === rawImg.data.length &&
+			blobSensor.data.every((value, index) => value === rawImg.data[index]);
 		const reImg = await reuse.imageData();
 
 		// dispose() must reject in-flight calls instead of hanging.
@@ -219,6 +223,7 @@ const withTimeout = (p, ms, label) => Promise.race([
 		window.__RESULT = {
 			ok: true,
 			sensorCopiesEqual, sensorCopiesIndependent, sensorSurvivesDispose,
+			blobSensorEqual, blobOpenTimings,
 			sensorTimings: rawImg.timings,
 			model: meta?.camera_model,
 			dngW: dngImg?.width, dngH: dngImg?.height, dngColors: dngImg?.colors,
@@ -342,6 +347,9 @@ const checks = [];
 const check = (cond, msg) => checks.push({ ok: !!cond, msg });
 check(r && r.ok, 'page ran without error');
 if (r && r.ok) {
+	check(r.blobSensorEqual, 'warmed worker opens a Blob with identical sensor samples after reuse');
+	check(r.blobOpenTimings && ['fileReadMs', 'openMs'].every(key =>
+		Number.isFinite(r.blobOpenTimings[key]) && r.blobOpenTimings[key] >= 0), 'Blob opening reports worker file-read and open timings');
 	check(r.sensorCopiesEqual, 'bulk sensor copies preserve every sample across repeated reads');
 	check(r.sensorCopiesIndependent, 'sensor copies have independent owned buffers');
 	check(r.sensorSurvivesDispose, 'sensor pixels remain available after the decoder is disposed');

@@ -814,6 +814,10 @@ export default class LibRaw {
    * Open and decode a RAW buffer.
    */
   open(bytes: BufferSource, settings?: LibRawSettings): Promise<void>;
+  /** Initialize the worker and WASM without opening a file. */
+  warmup(): Promise<void>;
+  /** Read a Blob inside the worker; returned timings exclude worker queue wait. */
+  openBlob(blob: Blob, settings?: LibRawSettings): Promise<{fileReadMs: number; openMs: number}>;
 
   /**
    * Incrementally open RAW bytes from a stream or async iterable.

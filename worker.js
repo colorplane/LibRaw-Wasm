@@ -30,7 +30,19 @@ self.onmessage = async (event) => {
 				timestamp: performance.now()
 			});
 		}
-		const out = raw[fn](...args);
+		let out;
+		if (fn === 'warmup') {
+			out = true;
+		} else if (fn === 'openBlob') {
+			const readStart = performance.now();
+			const bytes = new Uint8Array(await args[0].arrayBuffer());
+			const fileReadMs = performance.now() - readStart;
+			const openStart = performance.now();
+			raw.open(bytes, args[1]);
+			out = {fileReadMs, openMs: performance.now() - openStart};
+		} else {
+			out = raw[fn](...args);
+		}
 		if (fn === 'beginIncrementalInput') {
 			out.heapBuffer = out.sharedView.buffer;
 			delete out.sharedView;
